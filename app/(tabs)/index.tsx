@@ -34,12 +34,11 @@ Notifications.setNotificationHandler({
 });
 
 type Item = { id: string; name: string; done: boolean; createdAt: number };
-type Card = { id: string; shopName: string; cardNumber: string };
+type Card = { id: string; shopName: string; cardNumber: string; logoUrl?: string };
 
 const SHOPS = [{ id: '1', name: 'スーパー', latitude: 0, longitude: 0 }];
 const NOTIFY_RADIUS = 200;
 
-// ── Code128 バーコード（Canvas描画）────────────────────────
 const C128: Record<string, number[]> = {
   ' ':[2,1,2,2,2,2],'!':[2,2,2,1,2,2],'"':[2,2,2,2,2,1],'#':[1,2,1,2,2,3],
   '$':[1,2,1,3,2,2],'%':[1,3,1,2,2,2],'&':[1,2,2,2,1,3],"'":[1,2,2,3,1,2],
@@ -55,11 +54,10 @@ const C128: Record<string, number[]> = {
   'L':[1,3,3,1,2,1],'M':[1,1,2,1,3,3],'N':[1,1,2,3,3,1],'O':[1,3,2,1,3,1],
   'P':[3,1,1,1,2,3],'Q':[3,1,1,3,2,1],'R':[3,3,1,1,2,1],'S':[3,1,2,1,1,3],
   'T':[3,1,2,3,1,1],'U':[3,3,2,1,1,1],'V':[3,1,3,1,1,2],'W':[3,1,3,2,1,1],
-  'X':[3,3,3,1,1,1],'Y':[1,1,2,1,1,5],'Z':[1,1,2,5,1,1],'[':[1,5,2,1,1,1],
-  '\\':[1,2,2,1,1,5],']':[1,2,2,5,1,1],'^':[1,5,2,1,1,2],'_':[1,2,3,1,1,5],
+  'X':[3,3,3,1,1,1],'Y':[1,1,2,1,1,5],'Z':[1,1,2,5,1,1],
 };
 const START_B = [2,1,1,4,1,2];
-const STOP    = [2,3,3,1,1,1,2];
+const STOP = [2,3,3,1,1,1,2];
 const C128_KEYS = Object.keys(C128);
 
 function buildBars(value: string): number[] {
@@ -96,7 +94,6 @@ function drawBarcode(canvas: HTMLCanvasElement, value: string) {
     x += w;
   });
 }
-// ────────────────────────────────────────────────────────────
 
 export default function HomeScreen() {
   const [items, setItems] = useState<Item[]>([]);
@@ -107,6 +104,7 @@ export default function HomeScreen() {
   const [showAddCard, setShowAddCard] = useState(false);
   const [shopName, setShopName] = useState('');
   const [cardNumber, setCardNumber] = useState('');
+  const [logoUrl, setLogoUrl] = useState('');
   const [selectedCard, setSelectedCard] = useState<Card | null>(null);
   const [barcodeUrl, setBarcodeUrl] = useState('');
   const notifiedShops = useRef<Set<string>>(new Set());
@@ -129,7 +127,6 @@ export default function HomeScreen() {
 
   useEffect(() => { setupLocationAndNotifications(); }, []);
 
-  // バーコード生成（Canvas → data URL）
   useEffect(() => {
     if (!selectedCard) { setBarcodeUrl(''); return; }
     if (typeof document === 'undefined') return;
@@ -169,8 +166,8 @@ export default function HomeScreen() {
     const R = 6371000;
     const dLat = (lat2 - lat1) * Math.PI / 180;
     const dLon = (lon2 - lon1) * Math.PI / 180;
-    const a = Math.sin(dLat / 2) ** 2 + Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) * Math.sin(dLon / 2) ** 2;
-    return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+    const a = Math.sin(dLat/2) ** 2 + Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) * Math.sin(dLon/2) ** 2;
+    return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
   };
 
   const addItem = async () => {
@@ -195,10 +192,12 @@ export default function HomeScreen() {
     await addDoc(collection(db, 'cards'), {
       shopName: shopName.trim(),
       cardNumber: cardNumber.trim(),
+      logoUrl: logoUrl.trim(),
       createdAt: Date.now()
     });
     setShopName('');
     setCardNumber('');
+    setLogoUrl('');
     setShowAddCard(false);
   };
 
@@ -254,11 +253,23 @@ export default function HomeScreen() {
             {cards.map(card => (
               <TouchableOpacity key={card.id} style={styles.cardItem}
                 onPress={() => { setSelectedCard(card); setShowCards(false); }}>
-                <Text style={styles.cardShopName}>{card.shopName}</Text>
-                <Text style={styles.cardNumber}>{card.cardNumber}</Text>
-                <TouchableOpacity onPress={() => deleteCard(card.id)}>
-                  <Text style={styles.deleteBtn}>削除</Text>
-                </TouchableOpacity>
+                <View style={styles.cardHeader}>
+                  {card.logoUrl ? (
+                    // @ts-ignore
+                    <img src={card.logoUrl} style={{ width: 50, height: 50, objectFit: 'contain', marginRight: 12, borderRadius: 8 }} alt="logo" />
+                  ) : (
+                    <View style={styles.logoPlaceholder}>
+                      <Text style={styles.logoPlaceholderText}>{card.shopName[0]}</Text>
+                    </View>
+                  )}
+                  <View style={{ flex: 1 }}>
+                    <Text style={styles.cardShopName}>{card.shopName}</Text>
+                    <Text style={styles.cardNumber}>{card.cardNumber}</Text>
+                  </View>
+                  <TouchableOpacity onPress={() => deleteCard(card.id)}>
+                    <Text style={styles.deleteBtn}>削除</Text>
+                  </TouchableOpacity>
+                </View>
               </TouchableOpacity>
             ))}
             {cards.length === 0 && <Text style={styles.empty}>カードが登録されていません</Text>}
@@ -289,6 +300,13 @@ export default function HomeScreen() {
             placeholder="カード番号"
             keyboardType="numeric"
           />
+          <TextInput
+            style={[styles.input, { marginTop: 12 }]}
+            value={logoUrl}
+            onChangeText={setLogoUrl}
+            placeholder="ロゴ画像のURL（省略可）"
+            autoCapitalize="none"
+          />
           <TouchableOpacity style={[styles.addCardBtn, { marginTop: 16 }]} onPress={addCard}>
             <Text style={styles.addBtnText}>保存</Text>
           </TouchableOpacity>
@@ -301,10 +319,20 @@ export default function HomeScreen() {
       {/* バーコード表示モーダル */}
       <Modal visible={!!selectedCard} animationType="slide">
         <View style={styles.modal}>
-          <Text style={styles.modalTitle}>{selectedCard?.shopName}</Text>
+          <View style={styles.cardHeader}>
+            {selectedCard?.logoUrl ? (
+              // @ts-ignore
+              <img src={selectedCard.logoUrl} style={{ width: 60, height: 60, objectFit: 'contain', marginRight: 12, borderRadius: 8 }} alt="logo" />
+            ) : (
+              <View style={styles.logoPlaceholder}>
+                <Text style={styles.logoPlaceholderText}>{selectedCard?.shopName[0]}</Text>
+              </View>
+            )}
+            <Text style={styles.modalTitle}>{selectedCard?.shopName}</Text>
+          </View>
           <View style={styles.barcodeContainer}>
             {barcodeUrl ? (
-              // @ts-ignore: Web専用
+              // @ts-ignore
               <img src={barcodeUrl} style={{ width: 300, height: 100 }} alt="barcode" />
             ) : (
               <Text style={styles.empty}>バーコードを生成中...</Text>
@@ -341,11 +369,14 @@ const styles = StyleSheet.create({
   modal: { flex: 1, backgroundColor: '#f5f5f5', paddingTop: 60, paddingHorizontal: 20 },
   modalTitle: { fontSize: 24, fontWeight: 'bold', marginBottom: 20, color: '#1a1a1a' },
   cardItem: { backgroundColor: '#fff', borderRadius: 10, padding: 16, marginBottom: 10, borderWidth: 0.5, borderColor: '#eee' },
+  cardHeader: { flexDirection: 'row', alignItems: 'center', marginBottom: 8 },
   cardShopName: { fontSize: 18, fontWeight: '600', color: '#1a1a1a', marginBottom: 4 },
-  cardNumber: { fontSize: 14, color: '#666', marginBottom: 8 },
+  cardNumber: { fontSize: 14, color: '#666' },
   cardNumberLarge: { fontSize: 20, fontWeight: '600', color: '#1a1a1a', marginTop: 12 },
   addCardBtn: { backgroundColor: '#4a90e2', borderRadius: 10, padding: 14, alignItems: 'center', marginBottom: 10 },
   closeBtn: { backgroundColor: '#ddd', borderRadius: 10, padding: 14, alignItems: 'center', marginBottom: 10 },
   closeBtnText: { color: '#333', fontWeight: '600', fontSize: 15 },
   barcodeContainer: { backgroundColor: '#fff', borderRadius: 10, padding: 20, alignItems: 'center', marginVertical: 20 },
+  logoPlaceholder: { width: 50, height: 50, borderRadius: 8, backgroundColor: '#4a90e2', alignItems: 'center', justifyContent: 'center', marginRight: 12 },
+  logoPlaceholderText: { color: '#fff', fontSize: 20, fontWeight: 'bold' },
 });
