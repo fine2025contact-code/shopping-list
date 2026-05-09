@@ -39,6 +39,65 @@ type Card = { id: string; shopName: string; cardNumber: string };
 const SHOPS = [{ id: '1', name: 'スーパー', latitude: 0, longitude: 0 }];
 const NOTIFY_RADIUS = 200;
 
+// ── Code128 バーコード（Canvas描画）────────────────────────
+const C128: Record<string, number[]> = {
+  ' ':[2,1,2,2,2,2],'!':[2,2,2,1,2,2],'"':[2,2,2,2,2,1],'#':[1,2,1,2,2,3],
+  '$':[1,2,1,3,2,2],'%':[1,3,1,2,2,2],'&':[1,2,2,2,1,3],"'":[1,2,2,3,1,2],
+  '(':[1,3,2,2,1,2],')':[2,2,1,2,1,3],'*':[2,2,1,3,1,2],'+':[2,3,1,2,1,2],
+  ',':[1,1,2,2,3,2],'-':[1,2,2,1,3,2],'.':[1,2,2,2,3,1],'/':[1,1,3,2,2,2],
+  '0':[1,2,3,1,2,2],'1':[1,2,3,2,2,1],'2':[2,2,3,2,1,1],'3':[2,2,1,1,3,2],
+  '4':[2,2,1,2,3,1],'5':[2,1,3,2,1,2],'6':[2,2,3,1,1,2],'7':[3,1,2,1,3,1],
+  '8':[3,1,1,2,2,2],'9':[3,2,1,1,2,2],':':[3,2,1,2,2,1],';':[3,1,2,2,1,2],
+  '<':[3,2,2,1,1,2],'=':[3,2,2,2,1,1],'>':[2,1,2,1,2,3],'?':[2,1,2,3,2,1],
+  '@':[2,3,2,1,2,1],'A':[1,1,1,3,2,3],'B':[1,3,1,1,2,3],'C':[1,3,1,3,2,1],
+  'D':[1,1,2,3,1,3],'E':[1,3,2,1,1,3],'F':[1,3,2,3,1,1],'G':[2,1,1,3,1,3],
+  'H':[2,3,1,1,1,3],'I':[2,3,1,3,1,1],'J':[1,1,3,1,2,3],'K':[1,1,3,3,2,1],
+  'L':[1,3,3,1,2,1],'M':[1,1,2,1,3,3],'N':[1,1,2,3,3,1],'O':[1,3,2,1,3,1],
+  'P':[3,1,1,1,2,3],'Q':[3,1,1,3,2,1],'R':[3,3,1,1,2,1],'S':[3,1,2,1,1,3],
+  'T':[3,1,2,3,1,1],'U':[3,3,2,1,1,1],'V':[3,1,3,1,1,2],'W':[3,1,3,2,1,1],
+  'X':[3,3,3,1,1,1],'Y':[1,1,2,1,1,5],'Z':[1,1,2,5,1,1],'[':[1,5,2,1,1,1],
+  '\\':[1,2,2,1,1,5],']':[1,2,2,5,1,1],'^':[1,5,2,1,1,2],'_':[1,2,3,1,1,5],
+};
+const START_B = [2,1,1,4,1,2];
+const STOP    = [2,3,3,1,1,1,2];
+const C128_KEYS = Object.keys(C128);
+
+function buildBars(value: string): number[] {
+  const bars = [...START_B];
+  let checksum = 104;
+  value.split('').forEach((ch, i) => {
+    const idx = C128_KEYS.indexOf(ch);
+    const pat = idx >= 0 ? C128[ch] : C128[' '];
+    bars.push(...pat);
+    checksum += (i + 1) * (idx >= 0 ? idx + 32 : 0);
+  });
+  const modIdx = checksum % 103;
+  bars.push(...(Object.values(C128)[modIdx] ?? C128[' ']));
+  bars.push(...STOP);
+  return bars;
+}
+
+function drawBarcode(canvas: HTMLCanvasElement, value: string) {
+  const bars = buildBars(value);
+  const total = bars.reduce((a, b) => a + b, 0);
+  const W = canvas.width;
+  const H = canvas.height;
+  const scale = W / total;
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return;
+  ctx.fillStyle = '#fff';
+  ctx.fillRect(0, 0, W, H);
+  let x = 0;
+  bars.forEach((w, i) => {
+    if (i % 2 === 0) {
+      ctx.fillStyle = '#000';
+      ctx.fillRect(x * scale, 0, w * scale, H);
+    }
+    x += w;
+  });
+}
+// ────────────────────────────────────────────────────────────
+
 export default function HomeScreen() {
   const [items, setItems] = useState<Item[]>([]);
   const [cards, setCards] = useState<Card[]>([]);
@@ -49,7 +108,7 @@ export default function HomeScreen() {
   const [shopName, setShopName] = useState('');
   const [cardNumber, setCardNumber] = useState('');
   const [selectedCard, setSelectedCard] = useState<Card | null>(null);
-  const [barcodeUrl, setBarcodeUrl] = useState<string>('');
+  const [barcodeUrl, setBarcodeUrl] = useState('');
   const notifiedShops = useRef<Set<string>>(new Set());
 
   useEffect(() => {
@@ -70,26 +129,15 @@ export default function HomeScreen() {
 
   useEffect(() => { setupLocationAndNotifications(); }, []);
 
+  // バーコード生成（Canvas → data URL）
   useEffect(() => {
-    if (selectedCard) {
-      try {
-        const canvas = document.createElement('canvas');
-        const bwipjs = require('@bwip-js/browser');
-        bwipjs.toCanvas(canvas, {
-          bcid: 'code128',
-          text: selectedCard.cardNumber,
-          scale: 3,
-          height: 20,
-          includetext: true,
-        });
-        setBarcodeUrl(canvas.toDataURL('image/png'));
-      } catch (e) {
-        console.log(e);
-        setBarcodeUrl('');
-      }
-    } else {
-      setBarcodeUrl('');
-    }
+    if (!selectedCard) { setBarcodeUrl(''); return; }
+    if (typeof document === 'undefined') return;
+    const canvas = document.createElement('canvas');
+    canvas.width = 300;
+    canvas.height = 100;
+    drawBarcode(canvas, selectedCard.cardNumber);
+    setBarcodeUrl(canvas.toDataURL('image/png'));
   }, [selectedCard]);
 
   const setupLocationAndNotifications = async () => {
@@ -121,8 +169,8 @@ export default function HomeScreen() {
     const R = 6371000;
     const dLat = (lat2 - lat1) * Math.PI / 180;
     const dLon = (lon2 - lon1) * Math.PI / 180;
-    const a = Math.sin(dLat/2) ** 2 + Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) * Math.sin(dLon/2) ** 2;
-    return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+    const a = Math.sin(dLat / 2) ** 2 + Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) * Math.sin(dLon / 2) ** 2;
+    return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
   };
 
   const addItem = async () => {
@@ -256,7 +304,8 @@ export default function HomeScreen() {
           <Text style={styles.modalTitle}>{selectedCard?.shopName}</Text>
           <View style={styles.barcodeContainer}>
             {barcodeUrl ? (
-              <img src={barcodeUrl} style={{ width: '100%', height: 120 }} alt="barcode" />
+              // @ts-ignore: Web専用
+              <img src={barcodeUrl} style={{ width: 300, height: 100 }} alt="barcode" />
             ) : (
               <Text style={styles.empty}>バーコードを生成中...</Text>
             )}
