@@ -7,7 +7,8 @@ import {
   doc, onSnapshot,
   orderBy,
   query,
-  updateDoc
+  updateDoc,
+  where
 } from 'firebase/firestore';
 import { useEffect, useRef, useState } from 'react';
 import {
@@ -33,11 +34,25 @@ Notifications.setNotificationHandler({
   }),
 });
 
-type Item = { id: string; name: string; done: boolean; createdAt: number };
-type Card = { id: string; shopName: string; cardNumber: string; logoUrl?: string };
+type Item = { id: string; name: string; done: boolean; createdAt: number; familyCode: string };
+type Card = { id: string; shopName: string; cardNumber: string; logoUrl?: string; color?: string; familyCode: string };
 
 const SHOPS = [{ id: '1', name: 'スーパー', latitude: 0, longitude: 0 }];
 const NOTIFY_RADIUS = 200;
+
+const COLORS = [
+  '#4a90e2', '#e24a4a', '#2ecc71', '#f39c12',
+  '#9b59b6', '#1abc9c', '#e67e22', '#34495e',
+];
+
+const PRESET_SHOPS = [
+  { name: 'キラヤ', logoUrl: 'https://www.google.com/s2/favicons?domain=kiraya-iida.com&sz=64' },
+  { name: 'カインズ', logoUrl: 'https://www.google.com/s2/favicons?domain=cainz.com&sz=64' },
+  { name: 'ニトリ', logoUrl: 'https://www.google.com/s2/favicons?domain=nitori-net.jp&sz=64' },
+  { name: '楽天', logoUrl: 'https://www.google.com/s2/favicons?domain=rakuten.co.jp&sz=64' },
+  { name: 'Tポイント', logoUrl: 'https://www.google.com/s2/favicons?domain=tsite.jp&sz=64' },
+  { name: 'シャトレーゼ', logoUrl: 'https://www.google.com/s2/favicons?domain=chateraise.co.jp&sz=64' },
+];
 
 const C128: Record<string, number[]> = {
   ' ':[2,1,2,2,2,2],'!':[2,2,2,1,2,2],'"':[2,2,2,2,2,1],'#':[1,2,1,2,2,3],
@@ -96,34 +111,45 @@ function drawBarcode(canvas: HTMLCanvasElement, value: string) {
 }
 
 export default function HomeScreen() {
+  const [familyCode, setFamilyCode] = useState<string | null>(null);
+  const [inputCode, setInputCode] = useState('');
   const [items, setItems] = useState<Item[]>([]);
   const [cards, setCards] = useState<Card[]>([]);
   const [text, setText] = useState('');
-  const [location, setLocation] = useState<Location.LocationObject | null>(null);
   const [showCards, setShowCards] = useState(false);
   const [showAddCard, setShowAddCard] = useState(false);
   const [shopName, setShopName] = useState('');
   const [cardNumber, setCardNumber] = useState('');
   const [logoUrl, setLogoUrl] = useState('');
+  const [selectedColor, setSelectedColor] = useState(COLORS[0]);
   const [selectedCard, setSelectedCard] = useState<Card | null>(null);
   const [barcodeUrl, setBarcodeUrl] = useState('');
   const notifiedShops = useRef<Set<string>>(new Set());
 
   useEffect(() => {
-    const q = query(collection(db, 'items'), orderBy('createdAt', 'asc'));
+    if (typeof window !== 'undefined') {
+      const saved = localStorage.getItem('familyCode');
+      if (saved) setFamilyCode(saved);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!familyCode) return;
+    const q = query(collection(db, 'items'), where('familyCode', '==', familyCode), orderBy('createdAt', 'asc'));
     const unsub = onSnapshot(q, snapshot => {
       setItems(snapshot.docs.map(d => ({ id: d.id, ...d.data() } as Item)));
     });
     return unsub;
-  }, []);
+  }, [familyCode]);
 
   useEffect(() => {
-    const q = query(collection(db, 'cards'), orderBy('createdAt', 'asc'));
+    if (!familyCode) return;
+    const q = query(collection(db, 'cards'), where('familyCode', '==', familyCode), orderBy('createdAt', 'asc'));
     const unsub = onSnapshot(q, snapshot => {
       setCards(snapshot.docs.map(d => ({ id: d.id, ...d.data() } as Card)));
     });
     return unsub;
-  }, []);
+  }, [familyCode]);
 
   useEffect(() => { setupLocationAndNotifications(); }, []);
 
@@ -144,7 +170,7 @@ export default function HomeScreen() {
     if (locStatus !== 'granted') return;
     await Location.watchPositionAsync(
       { accuracy: Location.Accuracy.High, distanceInterval: 50 },
-      (loc) => { setLocation(loc); checkNearbyShops(loc); }
+      (loc) => { checkNearbyShops(loc); }
     );
   };
 
@@ -170,9 +196,21 @@ export default function HomeScreen() {
     return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
   };
 
+  const enterCode = () => {
+    if (!inputCode.trim()) {
+      Alert.alert('コードを入力してください');
+      return;
+    }
+    const code = inputCode.trim().toLowerCase();
+    if (typeof window !== 'undefined') {
+      localStorage.setItem('familyCode', code);
+    }
+    setFamilyCode(code);
+  };
+
   const addItem = async () => {
-    if (!text.trim()) return;
-    await addDoc(collection(db, 'items'), { name: text.trim(), done: false, createdAt: Date.now() });
+    if (!text.trim() || !familyCode) return;
+    await addDoc(collection(db, 'items'), { name: text.trim(), done: false, createdAt: Date.now(), familyCode });
     setText('');
   };
 
@@ -184,8 +222,13 @@ export default function HomeScreen() {
     await deleteDoc(doc(db, 'items', id));
   };
 
+  const selectPresetShop = (preset: { name: string; logoUrl: string }) => {
+    setShopName(preset.name);
+    setLogoUrl(preset.logoUrl);
+  };
+
   const addCard = async () => {
-    if (!shopName.trim() || !cardNumber.trim()) {
+    if (!shopName.trim() || !cardNumber.trim() || !familyCode) {
       Alert.alert('お店の名前とカード番号を入力してください');
       return;
     }
@@ -193,21 +236,63 @@ export default function HomeScreen() {
       shopName: shopName.trim(),
       cardNumber: cardNumber.trim(),
       logoUrl: logoUrl.trim(),
+      color: selectedColor,
+      familyCode,
       createdAt: Date.now()
     });
     setShopName('');
     setCardNumber('');
     setLogoUrl('');
+    setSelectedColor(COLORS[0]);
     setShowAddCard(false);
   };
 
   const deleteCard = async (id: string) => {
-    await deleteDoc(doc(db, 'cards', id));
+    Alert.alert(
+      'カードを削除',
+      '本当に削除しますか？',
+      [
+        { text: 'キャンセル', style: 'cancel' },
+        { text: '削除', style: 'destructive', onPress: async () => {
+          await deleteDoc(doc(db, 'cards', id));
+        }},
+      ]
+    );
   };
+
+  if (!familyCode) {
+    return (
+      <KeyboardAvoidingView style={styles.loginContainer} behavior={Platform.OS === 'ios' ? 'padding' : 'height'}>
+        <Text style={styles.loginTitle}>買い物リスト</Text>
+        <Text style={styles.loginSubtitle}>家族コードを入力してください</Text>
+        <TextInput
+          style={styles.loginInput}
+          value={inputCode}
+          onChangeText={setInputCode}
+          placeholder="例：yamada2026"
+          autoCapitalize="none"
+          autoCorrect={false}
+        />
+        <TouchableOpacity style={styles.loginBtn} onPress={enterCode}>
+          <Text style={styles.loginBtnText}>開始する</Text>
+        </TouchableOpacity>
+        <Text style={styles.loginHint}>※ 家族全員が同じコードを使うと、リストが共有されます</Text>
+      </KeyboardAvoidingView>
+    );
+  }
 
   return (
     <KeyboardAvoidingView style={styles.container} behavior={Platform.OS === 'ios' ? 'padding' : 'height'}>
-      <Text style={styles.title}>買い物リスト</Text>
+      <View style={styles.headerRow}>
+        <Text style={styles.title}>買い物リスト</Text>
+        <TouchableOpacity onPress={() => {
+          if (typeof window !== 'undefined') localStorage.removeItem('familyCode');
+          setFamilyCode(null);
+          setInputCode('');
+        }}>
+          <Text style={styles.changeCode}>コード変更</Text>
+        </TouchableOpacity>
+      </View>
 
       <View style={styles.inputRow}>
         <TextInput
@@ -258,7 +343,7 @@ export default function HomeScreen() {
                     // @ts-ignore
                     <img src={card.logoUrl} style={{ width: 50, height: 50, objectFit: 'contain', marginRight: 12, borderRadius: 8 }} alt="logo" />
                   ) : (
-                    <View style={styles.logoPlaceholder}>
+                    <View style={[styles.logoPlaceholder, { backgroundColor: card.color || COLORS[0] }]}>
                       <Text style={styles.logoPlaceholderText}>{card.shopName[0]}</Text>
                     </View>
                   )}
@@ -285,8 +370,24 @@ export default function HomeScreen() {
 
       {/* カード追加モーダル */}
       <Modal visible={showAddCard} animationType="slide">
-        <View style={styles.modal}>
+        <ScrollView style={styles.modal}>
           <Text style={styles.modalTitle}>カードを追加</Text>
+
+          <Text style={styles.colorLabel}>よく使うお店から選択</Text>
+          <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{ marginBottom: 16 }}>
+            {PRESET_SHOPS.map(preset => (
+              <TouchableOpacity
+                key={preset.name}
+                onPress={() => selectPresetShop(preset)}
+                style={[styles.presetItem, shopName === preset.name && styles.presetItemSelected]}
+              >
+                {/* @ts-ignore */}
+                <img src={preset.logoUrl} style={{ width: 36, height: 36, objectFit: 'contain' }} alt={preset.name} />
+                <Text style={styles.presetName}>{preset.name}</Text>
+              </TouchableOpacity>
+            ))}
+          </ScrollView>
+
           <TextInput
             style={styles.input}
             value={shopName}
@@ -307,13 +408,29 @@ export default function HomeScreen() {
             placeholder="ロゴ画像のURL（省略可）"
             autoCapitalize="none"
           />
+
+          <Text style={styles.colorLabel}>アイコンの色（ロゴURLなしの場合）</Text>
+          <View style={styles.colorRow}>
+            {COLORS.map(color => (
+              <TouchableOpacity
+                key={color}
+                onPress={() => setSelectedColor(color)}
+                style={[
+                  styles.colorCircle,
+                  { backgroundColor: color },
+                  selectedColor === color && styles.colorCircleSelected
+                ]}
+              />
+            ))}
+          </View>
+
           <TouchableOpacity style={[styles.addCardBtn, { marginTop: 16 }]} onPress={addCard}>
             <Text style={styles.addBtnText}>保存</Text>
           </TouchableOpacity>
-          <TouchableOpacity style={styles.closeBtn} onPress={() => setShowAddCard(false)}>
+          <TouchableOpacity style={[styles.closeBtn, { marginBottom: 40 }]} onPress={() => setShowAddCard(false)}>
             <Text style={styles.closeBtnText}>キャンセル</Text>
           </TouchableOpacity>
-        </View>
+        </ScrollView>
       </Modal>
 
       {/* バーコード表示モーダル */}
@@ -324,7 +441,7 @@ export default function HomeScreen() {
               // @ts-ignore
               <img src={selectedCard.logoUrl} style={{ width: 60, height: 60, objectFit: 'contain', marginRight: 12, borderRadius: 8 }} alt="logo" />
             ) : (
-              <View style={styles.logoPlaceholder}>
+              <View style={[styles.logoPlaceholder, { backgroundColor: selectedCard?.color || COLORS[0] }]}>
                 <Text style={styles.logoPlaceholderText}>{selectedCard?.shopName[0]}</Text>
               </View>
             )}
@@ -349,8 +466,17 @@ export default function HomeScreen() {
 }
 
 const styles = StyleSheet.create({
+  loginContainer: { flex: 1, backgroundColor: '#f5f5f5', paddingTop: 120, paddingHorizontal: 32 },
+  loginTitle: { fontSize: 32, fontWeight: 'bold', color: '#1a1a1a', marginBottom: 8, textAlign: 'center' },
+  loginSubtitle: { fontSize: 16, color: '#666', marginBottom: 32, textAlign: 'center' },
+  loginInput: { backgroundColor: '#fff', borderRadius: 10, paddingHorizontal: 16, paddingVertical: 14, fontSize: 18, borderWidth: 0.5, borderColor: '#ddd', marginBottom: 16, textAlign: 'center' },
+  loginBtn: { backgroundColor: '#4a90e2', borderRadius: 10, padding: 16, alignItems: 'center', marginBottom: 16 },
+  loginBtnText: { color: '#fff', fontWeight: '600', fontSize: 17 },
+  loginHint: { fontSize: 13, color: '#aaa', textAlign: 'center' },
   container: { flex: 1, backgroundColor: '#f5f5f5', paddingTop: 60, paddingHorizontal: 20 },
-  title: { fontSize: 28, fontWeight: 'bold', marginBottom: 12, color: '#1a1a1a' },
+  headerRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: 12 },
+  title: { fontSize: 28, fontWeight: 'bold', color: '#1a1a1a' },
+  changeCode: { fontSize: 13, color: '#4a90e2' },
   inputRow: { flexDirection: 'row', marginBottom: 16, gap: 8 },
   input: { flex: 1, backgroundColor: '#fff', borderRadius: 10, paddingHorizontal: 14, paddingVertical: 12, fontSize: 16, borderWidth: 0.5, borderColor: '#ddd' },
   addBtn: { backgroundColor: '#4a90e2', borderRadius: 10, paddingHorizontal: 18, justifyContent: 'center' },
@@ -377,6 +503,13 @@ const styles = StyleSheet.create({
   closeBtn: { backgroundColor: '#ddd', borderRadius: 10, padding: 14, alignItems: 'center', marginBottom: 10 },
   closeBtnText: { color: '#333', fontWeight: '600', fontSize: 15 },
   barcodeContainer: { backgroundColor: '#fff', borderRadius: 10, padding: 20, alignItems: 'center', marginVertical: 20 },
-  logoPlaceholder: { width: 50, height: 50, borderRadius: 8, backgroundColor: '#4a90e2', alignItems: 'center', justifyContent: 'center', marginRight: 12 },
+  logoPlaceholder: { width: 50, height: 50, borderRadius: 8, alignItems: 'center', justifyContent: 'center', marginRight: 12 },
   logoPlaceholderText: { color: '#fff', fontSize: 20, fontWeight: 'bold' },
+  colorLabel: { fontSize: 14, color: '#666', marginTop: 16, marginBottom: 8 },
+  colorRow: { flexDirection: 'row', gap: 10, flexWrap: 'wrap' },
+  colorCircle: { width: 36, height: 36, borderRadius: 18 },
+  colorCircleSelected: { borderWidth: 3, borderColor: '#1a1a1a' },
+  presetItem: { alignItems: 'center', padding: 10, marginRight: 10, backgroundColor: '#fff', borderRadius: 10, borderWidth: 0.5, borderColor: '#eee', width: 70 },
+  presetItemSelected: { borderColor: '#4a90e2', borderWidth: 2 },
+  presetName: { fontSize: 10, color: '#666', marginTop: 4, textAlign: 'center' },
 });
