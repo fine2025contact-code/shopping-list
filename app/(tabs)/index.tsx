@@ -35,7 +35,17 @@ Notifications.setNotificationHandler({
 });
 
 type Item = { id: string; name: string; done: boolean; createdAt: number; familyCode: string };
-type Card = { id: string; shopName: string; cardNumber: string; logoUrl?: string; color?: string; familyCode: string };
+type Card = {
+  id: string;
+  shopName: string;
+  cardNumber: string;
+  logoUrl?: string;
+  color?: string;
+  familyCode: string;
+  codeType: string;
+  order?: number;
+  createdAt?: number;
+};
 
 const SHOPS = [{ id: '1', name: 'スーパー', latitude: 0, longitude: 0 }];
 const NOTIFY_RADIUS = 200;
@@ -43,6 +53,12 @@ const NOTIFY_RADIUS = 200;
 const COLORS = [
   '#4a90e2', '#e24a4a', '#2ecc71', '#f39c12',
   '#9b59b6', '#1abc9c', '#e67e22', '#34495e',
+];
+
+const CODE_TYPES = [
+  { label: 'バーコード (CODE128)', value: 'CODE128' },
+  { label: 'バーコード (EAN-13)', value: 'EAN13' },
+  { label: 'QRコード', value: 'QR' },
 ];
 
 const PRESET_SHOPS = [
@@ -110,6 +126,67 @@ function drawBarcode(canvas: HTMLCanvasElement, value: string) {
   });
 }
 
+function drawEAN13(canvas: HTMLCanvasElement, value: string) {
+  const digits = value.replace(/\s/g, '').substring(0, 13).padStart(13, '0');
+  const L = [[3,2,1,1],[2,2,2,1],[2,1,2,2],[1,4,1,1],[1,1,3,2],[1,2,3,1],[1,1,1,4],[1,3,1,2],[1,2,1,3],[3,1,1,2]];
+  const G = [[1,1,2,3],[1,2,2,2],[2,2,1,2],[1,1,4,1],[2,3,1,1],[1,3,2,1],[4,1,1,1],[2,1,3,1],[3,1,2,1],[2,1,1,3]];
+  const R = [[3,2,1,1],[2,2,2,1],[2,1,2,2],[1,4,1,1],[1,1,3,2],[1,2,3,1],[1,1,1,4],[1,3,1,2],[1,2,1,3],[3,1,1,2]].map(p => [...p].reverse());
+  const PARITY = ['LLLLLL','LLGLGG','LLGGLG','LLGGGL','LGLLGG','LGGLLG','LGGGLL','LGLGLG','LGLGGL','LGGLGL'];
+
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return;
+  const W = canvas.width;
+  const H = canvas.height;
+  ctx.fillStyle = '#fff';
+  ctx.fillRect(0, 0, W, H);
+
+  const moduleWidth = W / 95;
+  let x = 0;
+
+  const drawBar = (modules: number, dark: boolean) => {
+    if (dark) {
+      ctx.fillStyle = '#000';
+      ctx.fillRect(x * moduleWidth, 0, modules * moduleWidth, H * 0.85);
+    }
+    x += modules;
+  };
+
+  drawBar(1, true); drawBar(1, false); drawBar(1, true);
+
+  const parity = PARITY[parseInt(digits[0])];
+
+  for (let i = 1; i <= 6; i++) {
+    const d = parseInt(digits[i]);
+    const pattern = parity[i-1] === 'L' ? L[d] : G[d];
+    pattern.forEach((m, j) => drawBar(m, j % 2 === 0));
+  }
+
+  drawBar(1, false); drawBar(1, true); drawBar(1, false); drawBar(1, true); drawBar(1, false);
+
+  for (let i = 7; i <= 12; i++) {
+    const d = parseInt(digits[i]);
+    const pattern = R[d];
+    pattern.forEach((m, j) => drawBar(m, j % 2 === 0));
+  }
+
+  drawBar(1, true); drawBar(1, false); drawBar(1, true);
+
+  ctx.fillStyle = '#000';
+  ctx.font = `${moduleWidth * 8}px monospace`;
+  ctx.textAlign = 'center';
+  ctx.fillText(digits[0], moduleWidth * 2, H);
+  for (let i = 1; i <= 6; i++) {
+    ctx.fillText(digits[i], (3 + (i-1)*7 + 3.5) * moduleWidth, H);
+  }
+  for (let i = 7; i <= 12; i++) {
+    ctx.fillText(digits[i], (50 + (i-7)*7 + 3.5) * moduleWidth, H);
+  }
+}
+
+function generateQRUrl(value: string): string {
+  return `https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=${encodeURIComponent(value)}`;
+}
+
 export default function HomeScreen() {
   const [familyCode, setFamilyCode] = useState<string | null>(null);
   const [inputCode, setInputCode] = useState('');
@@ -122,6 +199,7 @@ export default function HomeScreen() {
   const [cardNumber, setCardNumber] = useState('');
   const [logoUrl, setLogoUrl] = useState('');
   const [selectedColor, setSelectedColor] = useState(COLORS[0]);
+  const [selectedCodeType, setSelectedCodeType] = useState('CODE128');
   const [selectedCard, setSelectedCard] = useState<Card | null>(null);
   const [barcodeUrl, setBarcodeUrl] = useState('');
   const notifiedShops = useRef<Set<string>>(new Set());
@@ -135,7 +213,11 @@ export default function HomeScreen() {
 
   useEffect(() => {
     if (!familyCode) return;
-    const q = query(collection(db, 'items'), where('familyCode', '==', familyCode), orderBy('createdAt', 'asc'));
+    const q = query(
+      collection(db, 'items'),
+      where('familyCode', '==', familyCode),
+      orderBy('createdAt', 'asc')
+    );
     const unsub = onSnapshot(q, snapshot => {
       setItems(snapshot.docs.map(d => ({ id: d.id, ...d.data() } as Item)));
     });
@@ -144,9 +226,19 @@ export default function HomeScreen() {
 
   useEffect(() => {
     if (!familyCode) return;
-    const q = query(collection(db, 'cards'), where('familyCode', '==', familyCode), orderBy('createdAt', 'asc'));
+    const q = query(
+      collection(db, 'cards'),
+      where('familyCode', '==', familyCode),
+      orderBy('createdAt', 'asc')
+    );
     const unsub = onSnapshot(q, snapshot => {
-      setCards(snapshot.docs.map(d => ({ id: d.id, ...d.data() } as Card)));
+      const rawCards = snapshot.docs.map(d => ({ id: d.id, ...d.data() } as Card));
+      const sorted = [...rawCards].sort((a, b) => {
+        const orderA = a.order !== undefined ? a.order : (a.createdAt ?? 0);
+        const orderB = b.order !== undefined ? b.order : (b.createdAt ?? 0);
+        return orderA - orderB;
+      });
+      setCards(sorted);
     });
     return unsub;
   }, [familyCode]);
@@ -155,11 +247,19 @@ export default function HomeScreen() {
 
   useEffect(() => {
     if (!selectedCard) { setBarcodeUrl(''); return; }
+    if (selectedCard.codeType === 'QR') {
+      setBarcodeUrl(generateQRUrl(selectedCard.cardNumber));
+      return;
+    }
     if (typeof document === 'undefined') return;
     const canvas = document.createElement('canvas');
-    canvas.width = 300;
-    canvas.height = 100;
-    drawBarcode(canvas, selectedCard.cardNumber);
+    canvas.width = 600;
+    canvas.height = 150;
+    if (selectedCard.codeType === 'EAN13') {
+      drawEAN13(canvas, selectedCard.cardNumber);
+    } else {
+      drawBarcode(canvas, selectedCard.cardNumber);
+    }
     setBarcodeUrl(canvas.toDataURL('image/png'));
   }, [selectedCard]);
 
@@ -175,6 +275,7 @@ export default function HomeScreen() {
   };
 
   const checkNearbyShops = (loc: Location.LocationObject) => {
+    if (items.length === 0) return;
     SHOPS.forEach(shop => {
       if (shop.latitude === 0) return;
       const dist = getDistance(loc.coords.latitude, loc.coords.longitude, shop.latitude, shop.longitude);
@@ -197,20 +298,20 @@ export default function HomeScreen() {
   };
 
   const enterCode = () => {
-    if (!inputCode.trim()) {
-      Alert.alert('コードを入力してください');
-      return;
-    }
+    if (!inputCode.trim()) return;
     const code = inputCode.trim().toLowerCase();
-    if (typeof window !== 'undefined') {
-      localStorage.setItem('familyCode', code);
-    }
+    if (typeof window !== 'undefined') localStorage.setItem('familyCode', code);
     setFamilyCode(code);
   };
 
   const addItem = async () => {
     if (!text.trim() || !familyCode) return;
-    await addDoc(collection(db, 'items'), { name: text.trim(), done: false, createdAt: Date.now(), familyCode });
+    await addDoc(collection(db, 'items'), {
+      name: text.trim(),
+      done: false,
+      createdAt: Date.now(),
+      familyCode
+    });
     setText('');
   };
 
@@ -232,32 +333,46 @@ export default function HomeScreen() {
       Alert.alert('お店の名前とカード番号を入力してください');
       return;
     }
+    const newOrder = cards.length;
     await addDoc(collection(db, 'cards'), {
       shopName: shopName.trim(),
       cardNumber: cardNumber.trim(),
       logoUrl: logoUrl.trim(),
       color: selectedColor,
+      codeType: selectedCodeType,
       familyCode,
+      order: newOrder,
       createdAt: Date.now()
     });
     setShopName('');
     setCardNumber('');
     setLogoUrl('');
     setSelectedColor(COLORS[0]);
+    setSelectedCodeType('CODE128');
     setShowAddCard(false);
   };
 
   const deleteCard = async (id: string) => {
-    Alert.alert(
-      'カードを削除',
-      '本当に削除しますか？',
-      [
+    if (typeof window !== 'undefined') {
+      const confirmed = window.confirm('本当に削除しますか？');
+      if (confirmed) await deleteDoc(doc(db, 'cards', id));
+    } else {
+      Alert.alert('カードを削除', '本当に削除しますか？', [
         { text: 'キャンセル', style: 'cancel' },
-        { text: '削除', style: 'destructive', onPress: async () => {
-          await deleteDoc(doc(db, 'cards', id));
-        }},
-      ]
-    );
+        { text: '削除', style: 'destructive', onPress: async () => await deleteDoc(doc(db, 'cards', id)) },
+      ]);
+    }
+  };
+
+  const moveCard = async (id: string, direction: 'up' | 'down') => {
+    const index = cards.findIndex(c => c.id === id);
+    if (direction === 'up' && index === 0) return;
+    if (direction === 'down' && index === cards.length - 1) return;
+    const swapIndex = direction === 'up' ? index - 1 : index + 1;
+    const currentOrder = cards[index].order ?? index;
+    const swapOrder = cards[swapIndex].order ?? swapIndex;
+    await updateDoc(doc(db, 'cards', id), { order: swapOrder });
+    await updateDoc(doc(db, 'cards', cards[swapIndex].id), { order: currentOrder });
   };
 
   if (!familyCode) {
@@ -330,12 +445,11 @@ export default function HomeScreen() {
         <Text style={styles.cardBtnText}>ポイントカード・バーコード</Text>
       </TouchableOpacity>
 
-      {/* ポイントカード一覧モーダル */}
       <Modal visible={showCards} animationType="slide">
         <View style={styles.modal}>
           <Text style={styles.modalTitle}>ポイントカード</Text>
           <ScrollView>
-            {cards.map(card => (
+            {cards.map((card, index) => (
               <TouchableOpacity key={card.id} style={styles.cardItem}
                 onPress={() => { setSelectedCard(card); setShowCards(false); }}>
                 <View style={styles.cardHeader}>
@@ -350,10 +464,19 @@ export default function HomeScreen() {
                   <View style={{ flex: 1 }}>
                     <Text style={styles.cardShopName}>{card.shopName}</Text>
                     <Text style={styles.cardNumber}>{card.cardNumber}</Text>
+                    <Text style={styles.codeTypeLabel}>{CODE_TYPES.find(c => c.value === card.codeType)?.label || 'バーコード'}</Text>
                   </View>
-                  <TouchableOpacity onPress={() => deleteCard(card.id)}>
-                    <Text style={styles.deleteBtn}>削除</Text>
-                  </TouchableOpacity>
+                  <View style={styles.cardActions}>
+                    <TouchableOpacity onPress={() => moveCard(card.id, 'up')} disabled={index === 0}>
+                      <Text style={[styles.arrowBtn, index === 0 && styles.arrowBtnDisabled]}>↑</Text>
+                    </TouchableOpacity>
+                    <TouchableOpacity onPress={() => moveCard(card.id, 'down')} disabled={index === cards.length - 1}>
+                      <Text style={[styles.arrowBtn, index === cards.length - 1 && styles.arrowBtnDisabled]}>↓</Text>
+                    </TouchableOpacity>
+                    <TouchableOpacity onPress={() => deleteCard(card.id)}>
+                      <Text style={styles.deleteBtn}>削除</Text>
+                    </TouchableOpacity>
+                  </View>
                 </View>
               </TouchableOpacity>
             ))}
@@ -368,7 +491,6 @@ export default function HomeScreen() {
         </View>
       </Modal>
 
-      {/* カード追加モーダル */}
       <Modal visible={showAddCard} animationType="slide">
         <ScrollView style={styles.modal}>
           <Text style={styles.modalTitle}>カードを追加</Text>
@@ -409,6 +531,21 @@ export default function HomeScreen() {
             autoCapitalize="none"
           />
 
+          <Text style={styles.colorLabel}>コードの種類</Text>
+          <View style={styles.codeTypeRow}>
+            {CODE_TYPES.map(ct => (
+              <TouchableOpacity
+                key={ct.value}
+                onPress={() => setSelectedCodeType(ct.value)}
+                style={[styles.codeTypeBtn, selectedCodeType === ct.value && styles.codeTypeBtnSelected]}
+              >
+                <Text style={[styles.codeTypeBtnText, selectedCodeType === ct.value && styles.codeTypeBtnTextSelected]}>
+                  {ct.label}
+                </Text>
+              </TouchableOpacity>
+            ))}
+          </View>
+
           <Text style={styles.colorLabel}>アイコンの色（ロゴURLなしの場合）</Text>
           <View style={styles.colorRow}>
             {COLORS.map(color => (
@@ -433,7 +570,6 @@ export default function HomeScreen() {
         </ScrollView>
       </Modal>
 
-      {/* バーコード表示モーダル */}
       <Modal visible={!!selectedCard} animationType="slide">
         <View style={styles.modal}>
           <View style={styles.cardHeader}>
@@ -449,10 +585,15 @@ export default function HomeScreen() {
           </View>
           <View style={styles.barcodeContainer}>
             {barcodeUrl ? (
-              // @ts-ignore
-              <img src={barcodeUrl} style={{ width: 300, height: 100 }} alt="barcode" />
+              selectedCard?.codeType === 'QR' ? (
+                // @ts-ignore
+                <img src={barcodeUrl} style={{ width: 200, height: 200 }} alt="qrcode" />
+              ) : (
+                // @ts-ignore
+                <img src={barcodeUrl} style={{ width: '100%', height: 150 }} alt="barcode" />
+              )
             ) : (
-              <Text style={styles.empty}>バーコードを生成中...</Text>
+              <Text style={styles.empty}>生成中...</Text>
             )}
             <Text style={styles.cardNumberLarge}>{selectedCard?.cardNumber}</Text>
           </View>
@@ -488,7 +629,7 @@ const styles = StyleSheet.create({
   checkMark: { color: '#fff', fontSize: 13, fontWeight: 'bold' },
   itemText: { fontSize: 16, color: '#1a1a1a' },
   itemDone: { textDecorationLine: 'line-through', color: '#aaa' },
-  deleteBtn: { color: '#e24a4a', fontSize: 14 },
+  deleteBtn: { color: '#e24a4a', fontSize: 14, textAlign: 'center' },
   empty: { textAlign: 'center', color: '#aaa', marginTop: 40, fontSize: 15 },
   cardBtn: { backgroundColor: '#9b59b6', borderRadius: 10, padding: 14, marginTop: 12, alignItems: 'center' },
   cardBtnText: { color: '#fff', fontWeight: '600', fontSize: 15 },
@@ -496,8 +637,12 @@ const styles = StyleSheet.create({
   modalTitle: { fontSize: 24, fontWeight: 'bold', marginBottom: 20, color: '#1a1a1a' },
   cardItem: { backgroundColor: '#fff', borderRadius: 10, padding: 16, marginBottom: 10, borderWidth: 0.5, borderColor: '#eee' },
   cardHeader: { flexDirection: 'row', alignItems: 'center', marginBottom: 8 },
+  cardActions: { flexDirection: 'column', alignItems: 'center', gap: 4 },
+  arrowBtn: { color: '#4a90e2', fontSize: 20, textAlign: 'center', paddingHorizontal: 8 },
+  arrowBtnDisabled: { color: '#ddd' },
   cardShopName: { fontSize: 18, fontWeight: '600', color: '#1a1a1a', marginBottom: 4 },
   cardNumber: { fontSize: 14, color: '#666' },
+  codeTypeLabel: { fontSize: 12, color: '#aaa', marginTop: 2 },
   cardNumberLarge: { fontSize: 20, fontWeight: '600', color: '#1a1a1a', marginTop: 12 },
   addCardBtn: { backgroundColor: '#4a90e2', borderRadius: 10, padding: 14, alignItems: 'center', marginBottom: 10 },
   closeBtn: { backgroundColor: '#ddd', borderRadius: 10, padding: 14, alignItems: 'center', marginBottom: 10 },
@@ -512,4 +657,9 @@ const styles = StyleSheet.create({
   presetItem: { alignItems: 'center', padding: 10, marginRight: 10, backgroundColor: '#fff', borderRadius: 10, borderWidth: 0.5, borderColor: '#eee', width: 70 },
   presetItemSelected: { borderColor: '#4a90e2', borderWidth: 2 },
   presetName: { fontSize: 10, color: '#666', marginTop: 4, textAlign: 'center' },
+  codeTypeRow: { flexDirection: 'column', gap: 8 },
+  codeTypeBtn: { backgroundColor: '#fff', borderRadius: 10, padding: 12, borderWidth: 0.5, borderColor: '#ddd' },
+  codeTypeBtnSelected: { backgroundColor: '#4a90e2', borderColor: '#4a90e2' },
+  codeTypeBtnText: { fontSize: 14, color: '#666', textAlign: 'center' },
+  codeTypeBtnTextSelected: { color: '#fff', fontWeight: '600' },
 });
