@@ -11,6 +11,25 @@ import {
   where
 } from 'firebase/firestore';
 import { useEffect, useRef, useState } from 'react';
+
+// Cookieヘルパー（iOSのPWAでlocalStorageが消えるのを防ぐため）
+function setCookie(name: string, value: string, days: number) {
+  const expires = new Date();
+  expires.setTime(expires.getTime() + days * 24 * 60 * 60 * 1000);
+  if (typeof document !== 'undefined') {
+    document.cookie = `${name}=${encodeURIComponent(value)};expires=${expires.toUTCString()};path=/;SameSite=Lax`;
+  }
+}
+function getCookie(name: string): string | null {
+  if (typeof document === 'undefined') return null;
+  const match = document.cookie.match(new RegExp('(^| )' + name + '=([^;]+)'));
+  return match ? decodeURIComponent(match[2]) : null;
+}
+function deleteCookie(name: string) {
+  if (typeof document !== 'undefined') {
+    document.cookie = `${name}=;expires=Thu, 01 Jan 1970 00:00:00 UTC;path=/;`;
+  }
+}
 import {
   Alert,
   FlatList, KeyboardAvoidingView,
@@ -206,8 +225,13 @@ export default function HomeScreen() {
 
   useEffect(() => {
     if (typeof window !== 'undefined') {
-      const saved = localStorage.getItem('familyCode');
-      if (saved) setFamilyCode(saved);
+      // CookieとlocalStorageの両方をチェック（移行のため）
+      const saved = getCookie('familyCode') || localStorage.getItem('familyCode');
+      if (saved) {
+        setFamilyCode(saved);
+        // localStorageにあればCookieに移行
+        setCookie('familyCode', saved, 365);
+      }
     }
   }, []);
 
@@ -300,7 +324,8 @@ export default function HomeScreen() {
   const enterCode = () => {
     if (!inputCode.trim()) return;
     const code = inputCode.trim().toLowerCase();
-    if (typeof window !== 'undefined') localStorage.setItem('familyCode', code);
+    setCookie('familyCode', code, 365); // 1年間保持
+    if (typeof window !== 'undefined') localStorage.setItem('familyCode', code); // 後方互換
     setFamilyCode(code);
   };
 
@@ -401,6 +426,7 @@ export default function HomeScreen() {
       <View style={styles.headerRow}>
         <Text style={styles.title}>買い物リスト</Text>
         <TouchableOpacity onPress={() => {
+          deleteCookie('familyCode');
           if (typeof window !== 'undefined') localStorage.removeItem('familyCode');
           setFamilyCode(null);
           setInputCode('');
