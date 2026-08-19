@@ -229,7 +229,7 @@ function renderCode(codeType: string, rawValue: string, maxWidthPx: number): Cod
     backgroundcolor: 'FFFFFF',
     barcolor: '000000',
   };
-  if (!isQR) base.height = 16;   // mm
+  if (!isQR) base.height = 13;   // mm
 
   const probe = document.createElement('canvas');
   bwip.toCanvas(probe, { ...base, scale: 1 });
@@ -241,9 +241,11 @@ function renderCode(codeType: string, rawValue: string, maxWidthPx: number): Cod
   return { url: canvas.toDataURL('image/png'), width: canvas.width, height: canvas.height };
 }
 
-function availableCodeWidth(): number {
+// コードの表示幅。QRは正方形で縦を食うので小さめに抑える
+function availableCodeWidth(codeType: string): number {
   const w = typeof window !== 'undefined' ? Dimensions.get('window').width : 400;
-  return Math.max(230, Math.min(w, 620) - 110);
+  const usable = Math.max(230, Math.min(w, 620) - 80);
+  return codeType === 'QR' ? Math.min(usable, 170) : Math.min(usable, 300);
 }
 
 // Web では Alert.alert が動かないので window.alert にフォールバックする
@@ -262,10 +264,18 @@ function notify(message: string) {
 const DIAL = {
   cx: -150,          // 円の中心X（画面左外）
   r: 320,            // 半径
-  angles: [-36, -18, 0, 18, 36],   // 見えている5枚の角度
+  maxAngle: 38,      // 端のカードの最大角度
   size: 50,          // 通常の丸の直径
   sizeSel: 62,       // 選択中の丸の直径
 };
+
+// 残りの高さに5枚が収まる角度を求める（狭い画面でも端が切れないようにする）
+function dialAngles(halfHeight: number): number[] {
+  const usable = Math.max(60, halfHeight - 40);            // 丸の半径ぶん余白を取る
+  const ratio = Math.min(Math.sin((DIAL.maxAngle * Math.PI) / 180), usable / DIAL.r);
+  const maxA = (Math.asin(Math.max(0.12, ratio)) * 180) / Math.PI;
+  return [-maxA, -maxA / 2, 0, maxA / 2, maxA];
+}
 
 export default function HomeScreen() {
   const [familyCode, setFamilyCode] = useState<string | null>(null);
@@ -360,7 +370,7 @@ export default function HomeScreen() {
     }
     if (typeof document === 'undefined') return;
     try {
-      setBarcode(renderCode(selectedCard.codeType, selectedCard.cardNumber, availableCodeWidth()));
+      setBarcode(renderCode(selectedCard.codeType, selectedCard.cardNumber, availableCodeWidth(selectedCard.codeType)));
       setBarcodeError('');
     } catch (e: any) {
       setBarcode(null);
@@ -383,7 +393,7 @@ export default function HomeScreen() {
       return;
     }
     try {
-      setPreviewImg(renderCode(selectedCodeType, cardNumber, availableCodeWidth()));
+      setPreviewImg(renderCode(selectedCodeType, cardNumber, availableCodeWidth(selectedCodeType)));
       setPreviewError('');
     } catch (e: any) {
       setPreviewImg(null);
@@ -567,6 +577,7 @@ export default function HomeScreen() {
       );
     }
     const cy = arcHeight > 0 ? arcHeight / 2 : 190;
+    const angles = dialAngles(cy);
     const railLeft = DIAL.cx - DIAL.r;
     const railTop = cy - DIAL.r;
 
@@ -585,7 +596,7 @@ export default function HomeScreen() {
           width: (DIAL.r - 26) * 2, height: (DIAL.r - 26) * 2, borderRadius: DIAL.r - 26,
         }]} />
 
-        {DIAL.angles.map((angDeg, k) => {
+        {angles.map((angDeg, k) => {
           const isSel = k === 2;
           const idx = (selectedIndex + (k - 2) + cards.length * 2) % cards.length;
           const card = cards[idx];
@@ -964,10 +975,10 @@ const styles = StyleSheet.create({
   // 上のコードシート（薄いグリーンの縁取り）
   codeSheet: {
     backgroundColor: '#fff', borderRadius: 24, borderWidth: 1.5, borderColor: C.greenLine,
-    paddingVertical: 15, paddingHorizontal: 18, alignItems: 'center', marginBottom: 14,
+    paddingVertical: 13, paddingHorizontal: 16, alignItems: 'center', marginBottom: 12,
   },
   codeSheetName: { fontSize: 15, fontWeight: '800', color: C.green, marginBottom: 10 },
-  codeSheetNum: { fontSize: 17, fontWeight: '800', color: C.tx, marginTop: 9, letterSpacing: 2 },
+  codeSheetNum: { fontSize: 17, fontWeight: '800', color: C.tx, marginTop: 8, letterSpacing: 2 },
   codeSheetHint: { fontSize: 10.5, color: C.txFaint, marginTop: 6, textAlign: 'center' },
   errorText: { color: '#C0392B', fontSize: 13, textAlign: 'center', lineHeight: 20 },
 

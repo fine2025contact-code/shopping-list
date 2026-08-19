@@ -44,3 +44,9 @@ app-example
 
 .vercel
 .env*.local
+
+# Claude作業用の一時フォルダ
+_backup/
+_to_delete/
+dist_check/
+dist_web/
