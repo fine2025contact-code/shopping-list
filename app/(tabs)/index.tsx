@@ -1,4 +1,5 @@
 import bwipjs from '@bwip-js/browser';
+import * as Haptics from 'expo-haptics';
 import * as Location from 'expo-location';
 import * as Notifications from 'expo-notifications';
 import {
@@ -248,6 +249,36 @@ function availableCodeWidth(codeType: string): number {
   return codeType === 'QR' ? Math.min(usable, 170) : Math.min(usable, 300);
 }
 
+// ===========================================================================
+// 触覚フィードバック（振動）
+//   ネイティブ: expo-haptics
+//   Web:        Vibration API（Android Chrome等。iOS Safariは非対応）
+// ===========================================================================
+function vibrateWeb(ms: number) {
+  const nav: any = typeof navigator !== 'undefined' ? navigator : null;
+  if (nav && typeof nav.vibrate === 'function') {
+    try { nav.vibrate(ms); } catch { /* 無視 */ }
+  }
+}
+
+// ダイヤルが1段送られた時の「カチッ」
+function hapticTick() {
+  if (Platform.OS === 'web') { vibrateWeb(10); return; }
+  Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light).catch(() => {});
+}
+
+// 選択が確定した時
+function hapticSelect() {
+  if (Platform.OS === 'web') { vibrateWeb(18); return; }
+  Haptics.selectionAsync().catch(() => {});
+}
+
+// 完了・保存など
+function hapticSuccess() {
+  if (Platform.OS === 'web') { vibrateWeb(28); return; }
+  Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
+}
+
 // Web では Alert.alert が動かないので window.alert にフォールバックする
 function notify(message: string) {
   if (typeof window !== 'undefined' && typeof window.alert === 'function') {
@@ -264,17 +295,45 @@ function notify(message: string) {
 const DIAL = {
   cx: -150,          // 円の中心X（画面左外）
   r: 320,            // 半径
-  maxAngle: 38,      // 端のカードの最大角度
-  size: 50,          // 通常の丸の直径
-  sizeSel: 62,       // 選択中の丸の直径
+  maxAngle: 38,      // 中央から2枚目までの最大角度
+  box: 64,           // 丸を入れる正方形（位置合わせの基準）
+  span: 3,           // 中央から何枚ぶん描くか（±3枚）
+  steps: 24,         // 補間の刻み数（多いほど円弧が正確）
 };
 
-// 残りの高さに5枚が収まる角度を求める（狭い画面でも端が切れないようにする）
-function dialAngles(halfHeight: number): number[] {
-  const usable = Math.max(60, halfHeight - 40);            // 丸の半径ぶん余白を取る
+// 残りの高さに収まる角度を求める（狭い画面でも端が切れないようにする）
+function dialMaxAngle(halfHeight: number): number {
+  const usable = Math.max(60, halfHeight - 40);
   const ratio = Math.min(Math.sin((DIAL.maxAngle * Math.PI) / 180), usable / DIAL.r);
-  const maxA = (Math.asin(Math.max(0.12, ratio)) * 180) / Math.PI;
-  return [-maxA, -maxA / 2, 0, maxA / 2, maxA];
+  return (Math.asin(Math.max(0.12, ratio)) * 180) / Math.PI;
+}
+
+// 円弧に沿った隣り合うカードの間隔（px）。指の移動量とこれを1:1で対応させる
+function dialStepPx(maxAngleDeg: number): number {
+  return Math.max(40, DIAL.r * ((maxAngleDeg / 2) * Math.PI) / 180);
+}
+
+type SlotTrack = { input: number[]; x: number[]; y: number[]; opacity: number[] };
+
+// カードi用の補間テーブルを作る。
+// pos（小数のインデックス）を入れると、円弧上の座標と透明度が返るようにする。
+function buildTrack(i: number, cy: number, maxAngleDeg: number): SlotTrack {
+  const input: number[] = [], x: number[] = [], y: number[] = [], opacity: number[] = [];
+  for (let n = 0; n <= DIAL.steps; n++) {
+    // s = 中央からの相対位置。+span 〜 -span（posの増加方向に対応）
+    const s = DIAL.span - (2 * DIAL.span * n) / DIAL.steps;
+    const rad = ((maxAngleDeg * (s / 2)) * Math.PI) / 180;
+    input.push(i - s);
+    x.push(DIAL.cx + DIAL.r * Math.cos(rad));
+    y.push(cy + DIAL.r * Math.sin(rad));
+    const a = Math.abs(s);
+    opacity.push(a <= 1 ? 1 : a <= 2 ? 1 - (a - 1) * 0.6 : a <= 2.8 ? 0.4 * (1 - (a - 2) / 0.8) : 0);
+  }
+  return { input, x, y, opacity };
+}
+
+function clamp(v: number, lo: number, hi: number) {
+  return Math.max(lo, Math.min(hi, v));
 }
 
 export default function HomeScreen() {
@@ -369,14 +428,19 @@ export default function HomeScreen() {
       return;
     }
     if (typeof document === 'undefined') return;
-    try {
-      setBarcode(renderCode(selectedCard.codeType, selectedCard.cardNumber, availableCodeWidth(selectedCard.codeType)));
-      setBarcodeError('');
-    } catch (e: any) {
-      setBarcode(null);
-      const v = validateCode(selectedCard.codeType, selectedCard.cardNumber);
-      setBarcodeError(v || `コードを生成できませんでした：${e?.message ?? e}`);
-    }
+    // ダイヤルを速く回した時に何枚も描画しないよう、少しだけ待ってから生成する
+    const card = selectedCard;
+    const timer = setTimeout(() => {
+      try {
+        setBarcode(renderCode(card.codeType, card.cardNumber, availableCodeWidth(card.codeType)));
+        setBarcodeError('');
+      } catch (e: any) {
+        setBarcode(null);
+        const v = validateCode(card.codeType, card.cardNumber);
+        setBarcodeError(v || `コードを生成できませんでした：${e?.message ?? e}`);
+      }
+    }, 90);
+    return () => clearTimeout(timer);
   }, [selectedCard?.id, selectedCard?.cardNumber, selectedCard?.codeType]);
 
   // カード登録画面のプレビュー
@@ -402,22 +466,87 @@ export default function HomeScreen() {
   }, [showAddCard, cardNumber, selectedCodeType]);
 
   // ダイヤルの回転（上下ドラッグで1枚ずつ送る）
-  const dragAccum = useRef(0);
+  // ---- ダイヤルの回転 ----------------------------------------------------
+  // pos は「小数のインデックス」。指の動きに1:1で追従させ、離した時に
+  // 一番近いカードへバネでスナップする。段が変わるたびに振動する。
+  const pos = useRef(new Animated.Value(0)).current;
+  const posRef = useRef(0);
+  const dragStart = useRef(0);
+  const lastTick = useRef(0);
+
+  useEffect(() => {
+    const id = pos.addListener(({ value }) => { posRef.current = value; });
+    return () => pos.removeListener(id);
+  }, []);
+
+  const cyForDial = arcHeight > 0 ? arcHeight / 2 : 190;
+  const maxAngle = dialMaxAngle(cyForDial);
+  const stepPx = dialStepPx(maxAngle);
+
+  // 円弧上の座標テーブル（カード枚数・画面高さが変わった時だけ作り直す）
+  const tracks = useMemo(
+    () => cards.map((_, i) => buildTrack(i, cyForDial, maxAngle)),
+    [cards.length, cyForDial, maxAngle]
+  );
+
+  // 指定のカードへバネで寄せる
+  const springTo = (index: number) => {
+    const target = clamp(index, 0, Math.max(cards.length - 1, 0));
+    lastTick.current = target;
+    setSelectedIndex(target);
+    Animated.spring(pos, {
+      toValue: target,
+      useNativeDriver: useNative,
+      speed: 16,
+      bounciness: 5,
+    }).start();
+  };
+
+  // カードが増減・並び替えされた時に位置を合わせ直す
+  useEffect(() => {
+    if (cards.length === 0) return;
+    const target = clamp(selectedIndex, 0, cards.length - 1);
+    lastTick.current = target;
+    pos.setValue(target);
+  }, [cards.length]);
+
   const panResponder = useMemo(() => PanResponder.create({
-    onMoveShouldSetPanResponder: (_e, g) => Math.abs(g.dy) > 6 && Math.abs(g.dy) > Math.abs(g.dx),
-    onPanResponderGrant: () => { dragAccum.current = 0; },
+    // 丸の上から始めたドラッグでも回せるように capture 側で受ける
+    onMoveShouldSetPanResponderCapture: (_e, g) =>
+      Math.abs(g.dy) > 7 && Math.abs(g.dy) > Math.abs(g.dx),
+    onPanResponderTerminationRequest: () => false,
+    onPanResponderGrant: () => {
+      dragStart.current = posRef.current;
+      pos.stopAnimation();
+    },
     onPanResponderMove: (_e, g) => {
-      const step = 64;               // これだけ動かすと1枚送る
-      const delta = g.dy - dragAccum.current;
-      if (delta <= -step) {
-        dragAccum.current = g.dy;
-        setSelectedIndex(i => (i + 1) % Math.max(cards.length, 1));
-      } else if (delta >= step) {
-        dragAccum.current = g.dy;
-        setSelectedIndex(i => (i - 1 + Math.max(cards.length, 1)) % Math.max(cards.length, 1));
+      if (cards.length === 0) return;
+      // 上へドラッグ（dyが負）で次のカードへ。指の移動量と円弧の間隔を1:1で対応させる
+      const next = clamp(dragStart.current - g.dy / stepPx, -0.6, cards.length - 0.4);
+      pos.setValue(next);
+      const rounded = clamp(Math.round(next), 0, cards.length - 1);
+      if (rounded !== lastTick.current) {
+        lastTick.current = rounded;
+        setSelectedIndex(rounded);
+        hapticTick();
       }
     },
-  }), [cards.length]);
+    onPanResponderRelease: (_e, g) => {
+      if (cards.length === 0) return;
+      // 指を離した勢い（フリック）を足してスナップ先を決める。
+      // g.vy は px/ms なので、100ms ぶん滑る距離(px)として扱い、
+      // 速度スパイクで飛びすぎないよう ±1.5枚ぶんに制限する。
+      const fling = clamp((g.vy ?? 0) * 100, -stepPx * 1.5, stepPx * 1.5);
+      const raw = dragStart.current - (g.dy + fling) / stepPx;
+      const target = clamp(Math.round(raw), 0, cards.length - 1);
+      if (target !== lastTick.current) hapticTick();
+      springTo(target);
+      hapticSelect();
+    },
+    onPanResponderTerminate: () => {
+      springTo(clamp(Math.round(posRef.current), 0, Math.max(cards.length - 1, 0)));
+    },
+  }), [cards.length, stepPx]);
 
   const setupLocationAndNotifications = async () => {
     const { status: notifStatus } = await Notifications.requestPermissionsAsync();
@@ -463,6 +592,7 @@ export default function HomeScreen() {
 
   const addItem = async () => {
     if (!text.trim() || !familyCode) return;
+    hapticSuccess();
     await addDoc(collection(db, 'items'), {
       name: text.trim(), done: false, createdAt: Date.now(), familyCode
     });
@@ -470,6 +600,7 @@ export default function HomeScreen() {
   };
 
   const toggleItem = async (id: string, done: boolean) => {
+    hapticTick();
     await updateDoc(doc(db, 'items', id), { done: !done });
   };
 
@@ -508,6 +639,7 @@ export default function HomeScreen() {
     setSelectedColor(COLORS[0]);
     setSelectedCodeType('CODE128');
     setShowAddCard(false);
+    hapticSuccess();
   };
 
   const deleteCard = async (id: string) => {
@@ -571,15 +703,13 @@ export default function HomeScreen() {
   const renderDial = () => {
     if (cards.length === 0) {
       return (
-        <View style={styles.arc}>
+        <View style={styles.arc} onLayout={e => setArcHeight(e.nativeEvent.layout.height)}>
           <Text style={styles.empty}>カードが登録されていません</Text>
         </View>
       );
     }
-    const cy = arcHeight > 0 ? arcHeight / 2 : 190;
-    const angles = dialAngles(cy);
     const railLeft = DIAL.cx - DIAL.r;
-    const railTop = cy - DIAL.r;
+    const railTop = cyForDial - DIAL.r;
 
     return (
       <View
@@ -596,52 +726,54 @@ export default function HomeScreen() {
           width: (DIAL.r - 26) * 2, height: (DIAL.r - 26) * 2, borderRadius: DIAL.r - 26,
         }]} />
 
-        {angles.map((angDeg, k) => {
-          const isSel = k === 2;
-          const idx = (selectedIndex + (k - 2) + cards.length * 2) % cards.length;
-          const card = cards[idx];
-          if (!card) return null;
-          const a = (angDeg * Math.PI) / 180;
-          const x = DIAL.cx + DIAL.r * Math.cos(a);
-          const y = cy + DIAL.r * Math.sin(a);
-          const sz = isSel ? DIAL.sizeSel : DIAL.size;
+        {cards.map((card, i) => {
+          const track = tracks[i];
+          if (!track) return null;
+          const isSel = i === selectedIndex;
+          const translateX = pos.interpolate({
+            inputRange: track.input, outputRange: track.x, extrapolate: 'clamp',
+          });
+          const translateY = pos.interpolate({
+            inputRange: track.input, outputRange: track.y, extrapolate: 'clamp',
+          });
+          const opacity = pos.interpolate({
+            inputRange: track.input, outputRange: track.opacity, extrapolate: 'clamp',
+          });
           return (
-            <TouchableOpacity
-              key={`${card.id}-${k}`}
-              activeOpacity={0.75}
-              onPress={() => setSelectedIndex(idx)}
-              onLongPress={() => setMenuCard(card)}
-              style={[styles.slot, {
-                left: x - sz / 2,
-                top: y - sz / 2,
-                opacity: (k === 0 || k === 4) ? 0.4 : 1,
-              }]}
+            <Animated.View
+              key={card.id}
+              style={[styles.slot, { opacity, transform: [{ translateX }, { translateY }] }]}
             >
-              <View style={[
-                styles.dot,
-                { width: sz, height: sz, borderRadius: sz / 2 },
-                isSel && styles.dotSel,
-              ]}>
-                {card.logoUrl ? (
-                  // @ts-ignore
-                  <img src={card.logoUrl} alt="" style={{
-                    width: sz - 18, height: sz - 18, objectFit: 'contain', borderRadius: 8,
-                  }} />
-                ) : (
-                  <Text style={[styles.dotText, { fontSize: isSel ? 24 : 20 }, isSel && styles.dotTextSel]}>
-                    {card.shopName[0]}
+              <TouchableOpacity
+                activeOpacity={0.75}
+                onPress={() => { hapticSelect(); springTo(i); }}
+                onLongPress={() => { hapticSelect(); setMenuCard(card); }}
+                style={styles.slotTouch}
+              >
+                <View style={styles.dotBox}>
+                  <View style={[styles.dot, isSel && styles.dotSel]}>
+                    {card.logoUrl ? (
+                      // @ts-ignore
+                      <img src={card.logoUrl} alt="" style={{
+                        width: 32, height: 32, objectFit: 'contain', borderRadius: 7,
+                      }} />
+                    ) : (
+                      <Text style={[styles.dotText, isSel && styles.dotTextSel]}>
+                        {card.shopName[0]}
+                      </Text>
+                    )}
+                  </View>
+                </View>
+                <View style={styles.slotLabel}>
+                  <Text numberOfLines={1} style={[styles.slotName, isSel && styles.slotNameSel]}>
+                    {card.shopName}
                   </Text>
-                )}
-              </View>
-              <View style={styles.slotLabel}>
-                <Text numberOfLines={1} style={[styles.slotName, isSel && styles.slotNameSel]}>
-                  {card.shopName}
-                </Text>
-                <Text numberOfLines={1} style={[styles.slotSub, isSel && styles.slotSubSel]}>
-                  {codeTypeShort(card.codeType)}
-                </Text>
-              </View>
-            </TouchableOpacity>
+                  <Text numberOfLines={1} style={[styles.slotSub, isSel && styles.slotSubSel]}>
+                    {codeTypeShort(card.codeType)}
+                  </Text>
+                </View>
+              </TouchableOpacity>
+            </Animated.View>
           );
         })}
       </View>
@@ -676,7 +808,7 @@ export default function HomeScreen() {
             }],
           }]} />
         )}
-        <TouchableOpacity style={styles.tabBtn} onPress={() => setActiveTab('list')} activeOpacity={0.8}>
+        <TouchableOpacity style={styles.tabBtn} onPress={() => { hapticSelect(); setActiveTab('list'); }} activeOpacity={0.8}>
           <Text style={[styles.tabText, activeTab === 'list' && styles.tabTextActive]}>買い物リスト</Text>
           {items.filter(i => !i.done).length > 0 && (
             <View style={[styles.tabBadge, activeTab === 'list' && styles.tabBadgeActive]}>
@@ -686,7 +818,7 @@ export default function HomeScreen() {
             </View>
           )}
         </TouchableOpacity>
-        <TouchableOpacity style={styles.tabBtn} onPress={() => setActiveTab('cards')} activeOpacity={0.8}>
+        <TouchableOpacity style={styles.tabBtn} onPress={() => { hapticSelect(); setActiveTab('cards'); }} activeOpacity={0.8}>
           <Text style={[styles.tabText, activeTab === 'cards' && styles.tabTextActive]}>ポイントカード</Text>
           {cards.length > 0 && (
             <View style={[styles.tabBadge, activeTab === 'cards' && styles.tabBadgeActive]}>
@@ -990,13 +1122,20 @@ const styles = StyleSheet.create({
   arc: { flex: 1, marginHorizontal: -16, overflow: 'hidden' },
   rail: { position: 'absolute', borderWidth: 1.5, borderColor: C.greenFaint },
   rail2: { position: 'absolute', borderWidth: 1, borderColor: C.greenGhost },
-  slot: { position: 'absolute', flexDirection: 'row', alignItems: 'center', gap: 13 },
+  // 丸の中心を円弧上に合わせるため、64pxの箱の中央を基準点にする
+  slot: { position: 'absolute', left: -DIAL.box / 2, top: -DIAL.box / 2 },
+  slotTouch: { flexDirection: 'row', alignItems: 'center', gap: 11 },
+  dotBox: { width: DIAL.box, height: DIAL.box, alignItems: 'center', justifyContent: 'center' },
   dot: {
+    width: 50, height: 50, borderRadius: 25,
     alignItems: 'center', justifyContent: 'center', backgroundColor: '#fff',
     borderWidth: 2, borderColor: C.greenLine,
   },
-  dotSel: { backgroundColor: C.green, borderWidth: 3, borderColor: '#fff' },
-  dotText: { color: C.green, fontWeight: '800' },
+  dotSel: {
+    backgroundColor: C.green, borderWidth: 3, borderColor: '#fff',
+    transform: [{ scale: 1.24 }],
+  },
+  dotText: { color: C.green, fontWeight: '800', fontSize: 20 },
   dotTextSel: { color: '#fff' },
   slotLabel: { maxWidth: 118 },
   slotName: { fontSize: 14, fontWeight: '700', color: C.txMuted },
