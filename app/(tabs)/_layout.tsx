@@ -2,7 +2,6 @@ import { Tabs } from 'expo-router';
 import React from 'react';
 
 import { HapticTab } from '@/components/haptic-tab';
-import { IconSymbol } from '@/components/ui/icon-symbol';
 import { Colors } from '@/constants/theme';
 import { useColorScheme } from '@/hooks/use-color-scheme';
 
@@ -15,21 +14,12 @@ export default function TabLayout() {
         tabBarActiveTintColor: Colors[colorScheme ?? 'light'].tint,
         headerShown: false,
         tabBarButton: HapticTab,
+        // 画面下の「Home / Explore」バーは使わないので非表示にする。
+        // アプリ内の切り替えは画面上部の自前タブ（買い物リスト／ポイントカード）で行う。
+        tabBarStyle: { display: 'none' },
       }}>
-      <Tabs.Screen
-        name="index"
-        options={{
-          title: 'Home',
-          tabBarIcon: ({ color }) => <IconSymbol size={28} name="house.fill" color={color} />,
-        }}
-      />
-      <Tabs.Screen
-        name="explore"
-        options={{
-          title: 'Explore',
-          tabBarIcon: ({ color }) => <IconSymbol size={28} name="paperplane.fill" color={color} />,
-        }}
-      />
+      <Tabs.Screen name="index" options={{ title: 'Home' }} />
+      <Tabs.Screen name="explore" options={{ title: 'Explore' }} />
     </Tabs>
   );
 }

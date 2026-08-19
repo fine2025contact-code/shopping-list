@@ -8,7 +8,8 @@
     "android": "expo start --android",
     "ios": "expo start --ios",
     "web": "expo start --web",
-    "lint": "expo lint"
+    "lint": "expo lint",
+    "deploy:dist": "node scripts/deploy-dist.js"
   },
   "dependencies": {
     "@bwip-js/browser": "^4.10.1",

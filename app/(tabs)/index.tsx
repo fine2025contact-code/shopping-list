@@ -295,17 +295,22 @@ function notify(message: string) {
 const DIAL = {
   cx: -150,          // 円の中心X（画面左外）
   r: 320,            // 半径
-  maxAngle: 38,      // 中央から2枚目までの最大角度
+  maxAngle: 34,      // 間隔の上限（これ以上は広げない）
+  minAngle: 20,      // 間隔の下限（これ以下には詰めない）
+  fitSlots: 0.75,    // 「1.5枚ぶん（=2で割った0.75）が収まれば良い」として角度を決める
   box: 64,           // 丸を入れる正方形（位置合わせの基準）
   span: 3,           // 中央から何枚ぶん描くか（±3枚）
   steps: 24,         // 補間の刻み数（多いほど円弧が正確）
 };
 
-// 残りの高さに収まる角度を求める（狭い画面でも端が切れないようにする）
+// カード同士の間隔を決める角度を求める。
+// 「上下2枚目まで」ではなく「1.5枚ぶんが収まれば良い」として計算することで、
+// 画面が狭くても間隔を広く取れる（はみ出した端のカードは薄く消える）。
 function dialMaxAngle(halfHeight: number): number {
-  const usable = Math.max(60, halfHeight - 40);
-  const ratio = Math.min(Math.sin((DIAL.maxAngle * Math.PI) / 180), usable / DIAL.r);
-  return (Math.asin(Math.max(0.12, ratio)) * 180) / Math.PI;
+  const usable = Math.max(56, halfHeight - DIAL.box / 2 - 6);
+  const ratio = Math.min(0.94, usable / DIAL.r);
+  const fitted = ((Math.asin(Math.max(0.14, ratio)) * 180) / Math.PI) / DIAL.fitSlots;
+  return Math.min(DIAL.maxAngle, Math.max(DIAL.minAngle, fitted));
 }
 
 // 円弧に沿った隣り合うカードの間隔（px）。指の移動量とこれを1:1で対応させる
@@ -327,7 +332,7 @@ function buildTrack(i: number, cy: number, maxAngleDeg: number): SlotTrack {
     x.push(DIAL.cx + DIAL.r * Math.cos(rad));
     y.push(cy + DIAL.r * Math.sin(rad));
     const a = Math.abs(s);
-    opacity.push(a <= 1 ? 1 : a <= 2 ? 1 - (a - 1) * 0.6 : a <= 2.8 ? 0.4 * (1 - (a - 2) / 0.8) : 0);
+    opacity.push(a <= 1 ? 1 : a <= 2 ? 1 - (a - 1) * 0.72 : a <= 2.5 ? 0.28 * (1 - (a - 2) / 0.5) : 0);
   }
   return { input, x, y, opacity };
 }
@@ -1061,7 +1066,7 @@ const styles = StyleSheet.create({
   loginHint: { fontSize: 13, color: C.txFaint, textAlign: 'center' },
 
   // 全体
-  container: { flex: 1, backgroundColor: C.bg, paddingTop: 50, paddingHorizontal: 16 },
+  container: { flex: 1, backgroundColor: C.bg, paddingTop: 46, paddingHorizontal: 16 },
   headerRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: 12, paddingHorizontal: 4 },
   familyCodeLabel: { fontSize: 12.5, color: C.txMuted, flexShrink: 1 },
   changeCode: { fontSize: 12.5, color: C.or, fontWeight: '800' },
@@ -1069,7 +1074,7 @@ const styles = StyleSheet.create({
   // タブ
   tabBar: {
     flexDirection: 'row', backgroundColor: C.field, borderRadius: 19, padding: 5,
-    borderWidth: 1, borderColor: C.line, marginBottom: 16, position: 'relative',
+    borderWidth: 1, borderColor: C.line, marginBottom: 12, position: 'relative',
   },
   tabIndicator: {
     position: 'absolute', top: 5, left: 5, bottom: 5, borderRadius: 15, backgroundColor: C.green,
@@ -1107,15 +1112,15 @@ const styles = StyleSheet.create({
   // 上のコードシート（薄いグリーンの縁取り）
   codeSheet: {
     backgroundColor: '#fff', borderRadius: 24, borderWidth: 1.5, borderColor: C.greenLine,
-    paddingVertical: 13, paddingHorizontal: 16, alignItems: 'center', marginBottom: 12,
+    paddingVertical: 11, paddingHorizontal: 14, alignItems: 'center', marginBottom: 10,
   },
-  codeSheetName: { fontSize: 15, fontWeight: '800', color: C.green, marginBottom: 10 },
-  codeSheetNum: { fontSize: 17, fontWeight: '800', color: C.tx, marginTop: 8, letterSpacing: 2 },
-  codeSheetHint: { fontSize: 10.5, color: C.txFaint, marginTop: 6, textAlign: 'center' },
+  codeSheetName: { fontSize: 15, fontWeight: '800', color: C.green, marginBottom: 8 },
+  codeSheetNum: { fontSize: 17, fontWeight: '800', color: C.tx, marginTop: 6, letterSpacing: 1.5 },
+  codeSheetHint: { fontSize: 10, color: C.txFaint, marginTop: 4, textAlign: 'center' },
   errorText: { color: '#C0392B', fontSize: 13, textAlign: 'center', lineHeight: 20 },
 
   // ダイヤル
-  dialHead: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginHorizontal: 2, marginBottom: 6 },
+  dialHead: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginHorizontal: 2, marginBottom: 2 },
   dialHeadText: { fontSize: 12, fontWeight: '800', color: C.txMuted, letterSpacing: 1 },
   addPill: { height: 34, paddingHorizontal: 14, borderRadius: 17, backgroundColor: C.or, alignItems: 'center', justifyContent: 'center' },
   addPillText: { color: '#fff', fontSize: 12.5, fontWeight: '800' },

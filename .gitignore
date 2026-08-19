@@ -50,3 +50,5 @@ _backup/
 _to_delete/
 dist_check/
 dist_web/
+dist-deploy/
+_redirect/
