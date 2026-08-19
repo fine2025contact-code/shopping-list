@@ -515,42 +515,111 @@ export default function HomeScreen() {
     pos.setValue(target);
   }, [cards.length]);
 
-  const panResponder = useMemo(() => PanResponder.create({
-    // 丸の上から始めたドラッグでも回せるように capture 側で受ける
-    onMoveShouldSetPanResponderCapture: (_e, g) =>
-      Math.abs(g.dy) > 7 && Math.abs(g.dy) > Math.abs(g.dx),
-    onPanResponderTerminationRequest: () => false,
-    onPanResponderGrant: () => {
-      dragStart.current = posRef.current;
-      pos.stopAnimation();
-    },
-    onPanResponderMove: (_e, g) => {
-      if (cards.length === 0) return;
-      // 上へドラッグ（dyが負）で次のカードへ。指の移動量と円弧の間隔を1:1で対応させる
-      const next = clamp(dragStart.current - g.dy / stepPx, -0.6, cards.length - 0.4);
-      pos.setValue(next);
-      const rounded = clamp(Math.round(next), 0, cards.length - 1);
-      if (rounded !== lastTick.current) {
-        lastTick.current = rounded;
-        setSelectedIndex(rounded);
-        hapticTick();
+  // ---- 指の操作 ----------------------------------------------------------
+  // Web（iPhoneのSafari含む）では PanResponder ではなく Pointer Events を直接使う。
+  // 理由: 縦方向のスワイプをブラウザが「画面の引っぱり／スクロール」と解釈すると
+  //       途中でタッチがキャンセルされ、ダイヤルが戻ってしまう。
+  //       touchAction:'none' ＋ setPointerCapture で確実に自分が握る。
+  const arcEl = useRef<any>(null);   // Webでは <div> のDOMノードが入る
+  const drag = useRef({ active: false, startY: 0, startPos: 0, lastY: 0, lastT: 0, vel: 0, id: -1 });
+
+  const beginDrag = (y: number) => {
+    const d = drag.current;
+    d.active = true;
+    d.startY = y;
+    d.lastY = y;
+    d.lastT = Date.now();
+    d.vel = 0;
+    d.startPos = posRef.current;
+    pos.stopAnimation();
+  };
+
+  const moveDrag = (y: number) => {
+    const d = drag.current;
+    if (!d.active || cards.length === 0) return;
+    const now = Date.now();
+    const dt = Math.max(1, now - d.lastT);
+    d.vel = (y - d.lastY) / dt;      // px/ms
+    d.lastY = y;
+    d.lastT = now;
+    // 上へ動かす（yが減る）と次のカードへ。指の移動量と円弧の間隔は1:1
+    const next = clamp(d.startPos - (y - d.startY) / stepPx, -0.6, cards.length - 0.4);
+    pos.setValue(next);
+    const rounded = clamp(Math.round(next), 0, cards.length - 1);
+    if (rounded !== lastTick.current) {
+      lastTick.current = rounded;
+      setSelectedIndex(rounded);
+      hapticTick();
+    }
+  };
+
+  const endDrag = () => {
+    const d = drag.current;
+    if (!d.active) return;
+    d.active = false;
+    if (cards.length === 0) return;
+    // 離した勢い（フリック）を距離に換算して足す。飛びすぎないよう±1.5枚に制限
+    const fling = clamp(d.vel * 100, -stepPx * 1.5, stepPx * 1.5);
+    const raw = d.startPos - ((d.lastY - d.startY) + fling) / stepPx;
+    springTo(clamp(Math.round(raw), 0, cards.length - 1));
+    hapticSelect();
+  };
+
+  // Web: 円弧の領域に直接イベントを張る
+  useEffect(() => {
+    if (Platform.OS !== 'web') return;
+    const el = arcEl.current as any;
+    if (!el || typeof el.addEventListener !== 'function') return;
+
+    const THRESHOLD = 6;   // これ以上動いたら「回す操作」と判断（それ未満はタップ扱い）
+    let downY: number | null = null;
+    let pointerId = -1;
+
+    const onDown = (e: any) => {
+      downY = e.clientY;
+      pointerId = e.pointerId;
+    };
+    const onMove = (e: any) => {
+      if (downY === null) return;
+      if (!drag.current.active) {
+        if (Math.abs(e.clientY - downY) < THRESHOLD) return;
+        // ここで初めて主導権を取る。以降タップ判定は発生しない
+        try { el.setPointerCapture(pointerId); } catch { /* 無視 */ }
+        beginDrag(downY);
       }
-    },
-    onPanResponderRelease: (_e, g) => {
-      if (cards.length === 0) return;
-      // 指を離した勢い（フリック）を足してスナップ先を決める。
-      // g.vy は px/ms なので、100ms ぶん滑る距離(px)として扱い、
-      // 速度スパイクで飛びすぎないよう ±1.5枚ぶんに制限する。
-      const fling = clamp((g.vy ?? 0) * 100, -stepPx * 1.5, stepPx * 1.5);
-      const raw = dragStart.current - (g.dy + fling) / stepPx;
-      const target = clamp(Math.round(raw), 0, cards.length - 1);
-      if (target !== lastTick.current) hapticTick();
-      springTo(target);
-      hapticSelect();
-    },
-    onPanResponderTerminate: () => {
-      springTo(clamp(Math.round(posRef.current), 0, Math.max(cards.length - 1, 0)));
-    },
+      moveDrag(e.clientY);
+    };
+    const onUp = () => {
+      if (drag.current.active) endDrag();
+      downY = null;
+      try { el.releasePointerCapture(pointerId); } catch { /* 無視 */ }
+      pointerId = -1;
+    };
+
+    el.addEventListener('pointerdown', onDown);
+    el.addEventListener('pointermove', onMove);
+    el.addEventListener('pointerup', onUp);
+    el.addEventListener('pointercancel', onUp);
+    el.addEventListener('pointerleave', onUp);
+    return () => {
+      el.removeEventListener('pointerdown', onDown);
+      el.removeEventListener('pointermove', onMove);
+      el.removeEventListener('pointerup', onUp);
+      el.removeEventListener('pointercancel', onUp);
+      el.removeEventListener('pointerleave', onUp);
+    };
+    // タブを切り替えると円弧のDOMが作り直されるので activeTab も監視する
+  }, [cards.length, stepPx, activeTab]);
+
+  // ネイティブアプリ（iOS/Android）用。Webでは使わない
+  const panResponder = useMemo(() => PanResponder.create({
+    onMoveShouldSetPanResponderCapture: (_e, g) =>
+      Math.abs(g.dy) > 6 && Math.abs(g.dy) > Math.abs(g.dx),
+    onPanResponderTerminationRequest: () => false,
+    onPanResponderGrant: (_e, g) => beginDrag(g.y0),
+    onPanResponderMove: (_e, g) => moveDrag(g.y0 + g.dy),
+    onPanResponderRelease: () => endDrag(),
+    onPanResponderTerminate: () => endDrag(),
   }), [cards.length, stepPx]);
 
   const setupLocationAndNotifications = async () => {
@@ -718,9 +787,14 @@ export default function HomeScreen() {
 
     return (
       <View
-        style={styles.arc}
+        ref={arcEl}
+        style={[
+          styles.arc,
+          // Web専用: touchAction を切って、ブラウザに縦スワイプを取られないようにする
+          Platform.OS === 'web' ? ({ touchAction: 'none', userSelect: 'none' } as any) : null,
+        ]}
         onLayout={e => setArcHeight(e.nativeEvent.layout.height)}
-        {...panResponder.panHandlers}
+        {...(Platform.OS === 'web' ? {} : panResponder.panHandlers)}
       >
         {/* 円弧のレール */}
         <View pointerEvents="none" style={[styles.rail, {
