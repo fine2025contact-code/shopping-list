@@ -71,6 +71,37 @@ type Card = {
   createdAt?: number;
 };
 
+// ---------------------------------------------------------------------------
+// 在庫（日用品ストック）
+//   考え方：毎回「使った」を記録するのは続かないので、
+//           「1日にどれくらい減るか」だけ登録しておき、
+//           経過時間から自動で減らす。書き込みは補充・修正した時だけ。
+// ---------------------------------------------------------------------------
+type Stock = {
+  id: string;
+  familyCode: string;
+  name: string;
+  unit: string;          // 個 / 袋 / g / ml など
+  qty: number;           // lastCalcAt の時点の残量
+  perDay: number;        // 1日の消費量（0 = 自動で減らさない）
+  alertDays: number;     // 残り何日で知らせるか（perDay > 0 のとき）
+  alertQty: number;      // 残りいくつで知らせるか（perDay = 0 のとき）
+  autoAdd: boolean;      // 少なくなったら買い物リストへ自動で入れる
+  lastCalcAt: number;    // qty を確定した時刻
+  notifiedAt?: number | null; // 買い物リストへ自動追加した時刻（補充で消す）
+  createdAt: number;
+};
+
+// 「買ってきた物をまとめて1枚」の写真＋その日の補充内容
+type Restock = {
+  id: string;
+  familyCode: string;
+  photo?: string;        // data URL（圧縮済み・ネット購入時は無し）
+  memo?: string;
+  lines: { name: string; qty: number; unit: string }[];
+  createdAt: number;
+};
+
 const SHOPS = [{ id: '1', name: 'スーパー', latitude: 0, longitude: 0 }];
 const NOTIFY_RADIUS = 200;
 
@@ -107,6 +138,114 @@ const CODE_TYPES = [
   { label: 'バーコード (ITF)', value: 'ITF', short: 'ITF' },
   { label: 'QRコード', value: 'QR', short: 'QRコード' },
 ];
+
+// 在庫で使う単位
+const STOCK_UNITS = ['個', '本', '袋', '箱', '巻', '枚', 'g', 'ml', '回分'];
+
+// 消費ペースの入力単位（1日あたりへ換算するための係数）
+const PACE_PERIODS = [
+  { label: '1日で', value: 'day', perDayFactor: 1 },
+  { label: '1週間で', value: 'week', perDayFactor: 1 / 7 },
+  { label: '1か月で', value: 'month', perDayFactor: 1 / 30 },
+];
+
+// よく使う物のひな型。名前をタップするだけで単位とペースが埋まる
+const STOCK_PRESETS = [
+  { name: '犬のごはん', unit: 'g', qty: 3000, pace: 200, period: 'day' },
+  { name: 'コーヒー豆', unit: 'g', qty: 500, pace: 20, period: 'day' },
+  { name: 'トイレットペーパー', unit: '巻', qty: 12, pace: 1, period: 'day' },
+  { name: 'ティッシュ', unit: '箱', qty: 5, pace: 1, period: 'week' },
+  { name: '洗濯洗剤', unit: 'ml', qty: 1500, pace: 40, period: 'day' },
+  { name: '食器用洗剤', unit: 'ml', qty: 600, pace: 15, period: 'day' },
+  { name: 'シャンプー', unit: 'ml', qty: 500, pace: 12, period: 'day' },
+  { name: '米', unit: 'g', qty: 5000, pace: 300, period: 'day' },
+  { name: '牛乳', unit: '本', qty: 2, pace: 1, period: 'week' },
+  { name: 'ゴミ袋', unit: '枚', qty: 30, pace: 1, period: 'day' },
+  { name: '猫砂', unit: 'g', qty: 5000, pace: 200, period: 'day' },
+  { name: '乾電池', unit: '本', qty: 8, pace: 1, period: 'month' },
+];
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+// 「今」の推定残量。qty を確定した時刻からの経過分を引く。
+// 画面表示は毎回この計算で出し、Firestore には書き込まない。
+function effectiveQty(s: Stock): number {
+  if (!s.perDay || s.perDay <= 0) return s.qty;
+  const base = s.lastCalcAt || s.createdAt || Date.now();
+  const days = Math.max(0, (Date.now() - base) / DAY_MS);
+  return Math.max(0, s.qty - s.perDay * days);
+}
+
+// 残り日数（自動で減らさない物は null）
+function daysLeft(s: Stock): number | null {
+  if (!s.perDay || s.perDay <= 0) return null;
+  return effectiveQty(s) / s.perDay;
+}
+
+// 「そろそろ買う」の判定
+function isLow(s: Stock): boolean {
+  const d = daysLeft(s);
+  if (d === null) return effectiveQty(s) <= (s.alertQty ?? 1);
+  return d <= (s.alertDays ?? 5);
+}
+
+// 端数が出るので、整数はそのまま・小数は1桁で表示する
+function fmtQty(v: number): string {
+  const r = Math.round(v * 10) / 10;
+  return Number.isInteger(r) ? String(r) : r.toFixed(1);
+}
+
+function fmtDays(d: number): string {
+  if (d < 1) return 'あと1日以内';
+  return `あと約${Math.floor(d)}日`;
+}
+
+// ---------------------------------------------------------------------------
+// 写真の圧縮
+//   Firestore の1ドキュメント上限（1MiB）に収めるため、
+//   長辺1000pxに縮小し、収まるまで画質を落とす。
+//   保存されるのは data URL の文字列そのものなので、
+//   文字数（＝おおよそのバイト数）で判定する。
+// ---------------------------------------------------------------------------
+const PHOTO_MAX_CHARS = 700 * 1024;
+
+async function compressImage(file: File): Promise<string> {
+  const dataUrl: string = await new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result));
+    reader.onerror = () => reject(new Error('写真を読み込めませんでした'));
+    reader.readAsDataURL(file);
+  });
+
+  const img: HTMLImageElement = await new Promise((resolve, reject) => {
+    const im = new Image();
+    im.onload = () => resolve(im);
+    im.onerror = () => reject(new Error('写真を表示できませんでした'));
+    im.src = dataUrl;
+  });
+
+  const maxSide = 1000;
+  const scale = Math.min(1, maxSide / Math.max(img.width, img.height));
+  const w = Math.max(1, Math.round(img.width * scale));
+  const h = Math.max(1, Math.round(img.height * scale));
+
+  const canvas = document.createElement('canvas');
+  canvas.width = w;
+  canvas.height = h;
+  const ctx = canvas.getContext('2d');
+  if (!ctx) throw new Error('写真を変換できませんでした');
+  ctx.drawImage(img, 0, 0, w, h);
+
+  for (const q of [0.7, 0.6, 0.5, 0.4, 0.3]) {
+    const out = canvas.toDataURL('image/jpeg', q);
+    if (out.length <= PHOTO_MAX_CHARS) return out;
+  }
+  const last = canvas.toDataURL('image/jpeg', 0.25);
+  if (last.length > PHOTO_MAX_CHARS) {
+    throw new Error('この写真は大きすぎて保存できません。もう一度撮り直してください');
+  }
+  return last;
+}
 
 const PRESET_SHOPS = [
   { name: 'キラヤ', logoUrl: 'https://www.google.com/s2/favicons?domain=kiraya-iida.com&sz=64' },
@@ -347,7 +486,33 @@ export default function HomeScreen() {
   const [items, setItems] = useState<Item[]>([]);
   const [cards, setCards] = useState<Card[]>([]);
   const [text, setText] = useState('');
-  const [activeTab, setActiveTab] = useState<'list' | 'cards'>('list');
+  const [activeTab, setActiveTab] = useState<'list' | 'stock' | 'cards'>('list');
+
+  // ---- 在庫 ----
+  const [stocks, setStocks] = useState<Stock[]>([]);
+  const [restocks, setRestocks] = useState<Restock[]>([]);
+  const [tick, setTick] = useState(0);          // 残量の表示を定期的に更新するため
+  const [showStockForm, setShowStockForm] = useState(false);
+  const [editStock, setEditStock] = useState<Stock | null>(null);
+  const [sName, setSName] = useState('');
+  const [sUnit, setSUnit] = useState('個');
+  const [sQty, setSQty] = useState('');
+  const [sPace, setSPace] = useState('');
+  const [sPeriod, setSPeriod] = useState('day');
+  const [sAlertDays, setSAlertDays] = useState('5');
+  const [sAlertQty, setSAlertQty] = useState('1');
+  const [sAutoAdd, setSAutoAdd] = useState(true);
+  const [stockMenu, setStockMenu] = useState<Stock | null>(null);
+
+  // ---- まとめ補充（買ってきた物を1枚の写真＋数量で登録） ----
+  const [showRestock, setShowRestock] = useState(false);
+  const [rPhoto, setRPhoto] = useState<string | null>(null);
+  const [rMemo, setRMemo] = useState('');
+  const [rLines, setRLines] = useState<Record<string, number>>({});
+  const [rBusy, setRBusy] = useState(false);
+  const [photoView, setPhotoView] = useState<string | null>(null);
+  const photoInput = useRef<any>(null);
+  const autoAdded = useRef<Set<string>>(new Set());
   const [showAddCard, setShowAddCard] = useState(false);
   const [shopName, setShopName] = useState('');
   const [cardNumber, setCardNumber] = useState('');
@@ -413,11 +578,70 @@ export default function HomeScreen() {
     return unsub;
   }, [familyCode]);
 
+  // 在庫。where だけで取り、並び替えは手元でやる（複合インデックス不要）
+  useEffect(() => {
+    if (!familyCode) return;
+    const q = query(collection(db, 'stocks'), where('familyCode', '==', familyCode));
+    const unsub = onSnapshot(q, snapshot => {
+      const rows = snapshot.docs.map(d => ({ id: d.id, ...d.data() } as Stock));
+      rows.sort((a, b) => (a.createdAt ?? 0) - (b.createdAt ?? 0));
+      setStocks(rows);
+    }, () => { /* 権限エラー等は無視（在庫タブが空で表示される） */ });
+    return unsub;
+  }, [familyCode]);
+
+  // 補充の記録（写真つき）。表示は直近12件だけ
+  useEffect(() => {
+    if (!familyCode) return;
+    const q = query(collection(db, 'restocks'), where('familyCode', '==', familyCode));
+    const unsub = onSnapshot(q, snapshot => {
+      const rows = snapshot.docs.map(d => ({ id: d.id, ...d.data() } as Restock));
+      rows.sort((a, b) => (b.createdAt ?? 0) - (a.createdAt ?? 0));
+      setRestocks(rows.slice(0, 12));
+    }, () => { /* 同上 */ });
+    return unsub;
+  }, [familyCode]);
+
+  // 残量は時間で減るので、表示を10分ごとに描き直す
+  useEffect(() => {
+    const id = setInterval(() => setTick(t => t + 1), 10 * 60 * 1000);
+    return () => clearInterval(id);
+  }, []);
+
+  // 少なくなった物を買い物リストへ自動で入れる。
+  // 二重登録を防ぐため、stocks 側の notifiedAt と同名の未チェック項目を見る。
+  useEffect(() => {
+    if (!familyCode || stocks.length === 0) return;
+    stocks.forEach(async s => {
+      if (!s.autoAdd) return;
+      if (!isLow(s)) return;
+      if (s.notifiedAt) return;
+      if (autoAdded.current.has(s.id)) return;
+      if (items.some(i => !i.done && i.name === s.name)) return;
+      autoAdded.current.add(s.id);
+      try {
+        await addDoc(collection(db, 'items'), {
+          name: s.name, done: false, createdAt: Date.now(), familyCode,
+        });
+        await updateDoc(doc(db, 'stocks', s.id), { notifiedAt: Date.now() });
+      } catch {
+        autoAdded.current.delete(s.id);
+      }
+    });
+  }, [stocks, items, familyCode, tick]);
+
   useEffect(() => { setupLocationAndNotifications(); }, []);
+
+  const TABS: { key: 'list' | 'stock' | 'cards'; label: string }[] = [
+    { key: 'list', label: '買い物' },
+    { key: 'stock', label: '在庫' },
+    { key: 'cards', label: 'カード' },
+  ];
+  const tabIndex = TABS.findIndex(t => t.key === activeTab);
 
   useEffect(() => {
     Animated.timing(indicatorAnim, {
-      toValue: activeTab === 'list' ? 0 : 1,
+      toValue: Math.max(0, tabIndex),
       duration: 300,
       useNativeDriver: useNative,
     }).start();
@@ -750,6 +974,191 @@ export default function HomeScreen() {
 
   const codeTypeShort = (v: string) => CODE_TYPES.find(c => c.value === v)?.short || 'バーコード';
 
+  // ---------- 在庫の操作 ----------
+  const lowStocks = useMemo(
+    () => stocks.filter(isLow),
+    [stocks, tick]
+  );
+
+  const stockBadge = (key: string) => {
+    if (key === 'list') return items.filter(i => !i.done).length;
+    if (key === 'stock') return lowStocks.length;
+    return cards.length;
+  };
+
+  const openStockForm = (s: Stock | null) => {
+    setEditStock(s);
+    if (s) {
+      setSName(s.name);
+      setSUnit(s.unit || '個');
+      setSQty(fmtQty(effectiveQty(s)));
+      // 1日あたりの値を、入れやすい期間に戻して表示する
+      if (!s.perDay) {
+        setSPace('');
+        setSPeriod('day');
+      } else if (s.perDay >= 1) {
+        setSPace(fmtQty(s.perDay));
+        setSPeriod('day');
+      } else if (s.perDay * 7 >= 1) {
+        setSPace(fmtQty(s.perDay * 7));
+        setSPeriod('week');
+      } else {
+        setSPace(fmtQty(s.perDay * 30));
+        setSPeriod('month');
+      }
+      setSAlertDays(String(s.alertDays ?? 5));
+      setSAlertQty(String(s.alertQty ?? 1));
+      setSAutoAdd(s.autoAdd !== false);
+    } else {
+      setSName('');
+      setSUnit('個');
+      setSQty('');
+      setSPace('');
+      setSPeriod('day');
+      setSAlertDays('5');
+      setSAlertQty('1');
+      setSAutoAdd(true);
+    }
+    setShowStockForm(true);
+  };
+
+  const applyStockPreset = (p: typeof STOCK_PRESETS[number]) => {
+    setSName(p.name);
+    setSUnit(p.unit);
+    setSQty(String(p.qty));
+    setSPace(String(p.pace));
+    setSPeriod(p.period);
+    hapticSelect();
+  };
+
+  const saveStock = async () => {
+    if (!familyCode) return;
+    const name = sName.trim();
+    if (!name) { notify('品名を入力してください'); return; }
+    const qty = parseFloat(sQty);
+    if (!isFinite(qty) || qty < 0) { notify('今ある数量を入力してください'); return; }
+
+    const paceVal = parseFloat(sPace);
+    const factor = PACE_PERIODS.find(p => p.value === sPeriod)?.perDayFactor ?? 1;
+    const perDay = isFinite(paceVal) && paceVal > 0 ? paceVal * factor : 0;
+
+    const alertDays = Math.max(0, parseFloat(sAlertDays) || 0);
+    const alertQty = Math.max(0, parseFloat(sAlertQty) || 0);
+
+    const payload = {
+      name, unit: sUnit, qty, perDay, alertDays, alertQty,
+      autoAdd: sAutoAdd, lastCalcAt: Date.now(), notifiedAt: null, familyCode,
+    };
+
+    if (editStock) {
+      await updateDoc(doc(db, 'stocks', editStock.id), payload);
+    } else {
+      await addDoc(collection(db, 'stocks'), { ...payload, createdAt: Date.now() });
+    }
+    setShowStockForm(false);
+    setEditStock(null);
+    hapticSuccess();
+  };
+
+  const deleteStock = async (id: string) => {
+    setStockMenu(null);
+    const ok = typeof window !== 'undefined' && typeof window.confirm === 'function'
+      ? window.confirm('この在庫を削除しますか？')
+      : true;
+    if (ok) await deleteDoc(doc(db, 'stocks', id));
+  };
+
+  // 「使った」「買った」をその場で1つずつ動かす
+  const bumpStock = async (s: Stock, delta: number) => {
+    const now = effectiveQty(s);
+    const next = Math.max(0, now + delta);
+    hapticTick();
+    await updateDoc(doc(db, 'stocks', s.id), {
+      qty: next,
+      lastCalcAt: Date.now(),
+      // 補充して余裕ができたら、次にまた知らせられるようにする
+      notifiedAt: next > now ? null : (s.notifiedAt ?? null),
+    });
+    if (next > now) autoAdded.current.delete(s.id);
+  };
+
+  // ---------- まとめ補充 ----------
+  const openRestock = () => {
+    setRPhoto(null);
+    setRMemo('');
+    setRLines({});
+    setShowRestock(true);
+  };
+
+  const pickPhoto = async (file: File | undefined) => {
+    if (!file) return;
+    setRBusy(true);
+    try {
+      setRPhoto(await compressImage(file));
+    } catch (e: any) {
+      notify(e?.message || '写真を読み込めませんでした');
+    } finally {
+      setRBusy(false);
+    }
+  };
+
+  const setLine = (id: string, v: number) => {
+    setRLines(prev => {
+      const next = { ...prev };
+      if (v <= 0) delete next[id];
+      else next[id] = v;
+      return next;
+    });
+  };
+
+  const saveRestock = async () => {
+    if (!familyCode) return;
+    const ids = Object.keys(rLines);
+    if (ids.length === 0 && !rPhoto) {
+      notify('買った物の数量を入れるか、写真を選んでください');
+      return;
+    }
+    setRBusy(true);
+    try {
+      const lines: Restock['lines'] = [];
+      for (const id of ids) {
+        const s = stocks.find(x => x.id === id);
+        if (!s) continue;
+        const add = rLines[id];
+        const next = Math.max(0, effectiveQty(s) + add);
+        await updateDoc(doc(db, 'stocks', id), {
+          qty: next, lastCalcAt: Date.now(), notifiedAt: null,
+        });
+        autoAdded.current.delete(id);
+        lines.push({ name: s.name, qty: add, unit: s.unit });
+      }
+      await addDoc(collection(db, 'restocks'), {
+        familyCode,
+        photo: rPhoto ?? null,
+        memo: rMemo.trim(),
+        lines,
+        createdAt: Date.now(),
+      });
+      setShowRestock(false);
+      hapticSuccess();
+    } catch (e: any) {
+      notify(`保存できませんでした：${e?.message ?? e}`);
+    } finally {
+      setRBusy(false);
+    }
+  };
+
+  // 「そろそろ買う物」を買い物リストへ手で入れる
+  const addLowToList = async (s: Stock) => {
+    if (!familyCode) return;
+    if (items.some(i => !i.done && i.name === s.name)) { notify('すでに買い物リストにあります'); return; }
+    hapticSuccess();
+    await addDoc(collection(db, 'items'), {
+      name: s.name, done: false, createdAt: Date.now(), familyCode,
+    });
+    await updateDoc(doc(db, 'stocks', s.id), { notifiedAt: Date.now() });
+  };
+
   // ---------- ログイン ----------
   if (!familyCode) {
     return (
@@ -879,34 +1288,34 @@ export default function HomeScreen() {
       <View style={styles.tabBar} onLayout={e => setTabBarWidth(e.nativeEvent.layout.width)}>
         {tabBarWidth > 0 && (
           <Animated.View style={[styles.tabIndicator, {
-            width: (tabBarWidth - 10) / 2,
+            width: (tabBarWidth - 10) / TABS.length,
             transform: [{
               translateX: indicatorAnim.interpolate({
-                inputRange: [0, 1], outputRange: [0, (tabBarWidth - 10) / 2],
+                inputRange: TABS.map((_, i) => i),
+                outputRange: TABS.map((_, i) => (i * (tabBarWidth - 10)) / TABS.length),
               }),
             }],
           }]} />
         )}
-        <TouchableOpacity style={styles.tabBtn} onPress={() => { hapticSelect(); setActiveTab('list'); }} activeOpacity={0.8}>
-          <Text style={[styles.tabText, activeTab === 'list' && styles.tabTextActive]}>買い物リスト</Text>
-          {items.filter(i => !i.done).length > 0 && (
-            <View style={[styles.tabBadge, activeTab === 'list' && styles.tabBadgeActive]}>
-              <Text style={[styles.tabBadgeText, activeTab === 'list' && styles.tabBadgeTextActive]}>
-                {items.filter(i => !i.done).length}
-              </Text>
-            </View>
-          )}
-        </TouchableOpacity>
-        <TouchableOpacity style={styles.tabBtn} onPress={() => { hapticSelect(); setActiveTab('cards'); }} activeOpacity={0.8}>
-          <Text style={[styles.tabText, activeTab === 'cards' && styles.tabTextActive]}>ポイントカード</Text>
-          {cards.length > 0 && (
-            <View style={[styles.tabBadge, activeTab === 'cards' && styles.tabBadgeActive]}>
-              <Text style={[styles.tabBadgeText, activeTab === 'cards' && styles.tabBadgeTextActive]}>
-                {cards.length}
-              </Text>
-            </View>
-          )}
-        </TouchableOpacity>
+        {TABS.map(t => {
+          const on = activeTab === t.key;
+          const n = stockBadge(t.key);
+          return (
+            <TouchableOpacity
+              key={t.key}
+              style={styles.tabBtn}
+              onPress={() => { hapticSelect(); setActiveTab(t.key); }}
+              activeOpacity={0.8}
+            >
+              <Text style={[styles.tabText, on && styles.tabTextActive]}>{t.label}</Text>
+              {n > 0 && (
+                <View style={[styles.tabBadge, on && styles.tabBadgeActive]}>
+                  <Text style={[styles.tabBadgeText, on && styles.tabBadgeTextActive]}>{n}</Text>
+                </View>
+              )}
+            </TouchableOpacity>
+          );
+        })}
       </View>
 
       {/* ===== タブ1：買い物リスト ===== */}
@@ -949,7 +1358,140 @@ export default function HomeScreen() {
         </Animated.View>
       )}
 
-      {/* ===== タブ2：ポイントカード（上＝コード／下＝ダイヤル） ===== */}
+      {/* ===== タブ2：在庫 ===== */}
+      {activeTab === 'stock' && (
+        <Animated.View style={[styles.tabPage, contentStyle]}>
+          <ScrollView style={styles.flex1} contentContainerStyle={{ paddingBottom: 28 }}>
+            {/* そろそろ買う物（アプリを開いた時のお知らせ） */}
+            {lowStocks.length > 0 && (
+              <View style={styles.alertBox}>
+                <Text style={styles.alertTitle}>そろそろ買う物　{lowStocks.length}件</Text>
+                {lowStocks.map(s => {
+                  const d = daysLeft(s);
+                  const inList = items.some(i => !i.done && i.name === s.name);
+                  return (
+                    <View key={s.id} style={styles.alertRow}>
+                      <View style={styles.flex1}>
+                        <Text style={styles.alertName}>{s.name}</Text>
+                        <Text style={styles.alertSub}>
+                          残り {fmtQty(effectiveQty(s))}{s.unit}
+                          {d !== null ? `・${fmtDays(d)}` : ''}
+                        </Text>
+                      </View>
+                      {inList ? (
+                        <Text style={styles.alertDone}>リスト済</Text>
+                      ) : (
+                        <TouchableOpacity style={styles.alertBtn} onPress={() => addLowToList(s)} activeOpacity={0.85}>
+                          <Text style={styles.alertBtnText}>リストへ</Text>
+                        </TouchableOpacity>
+                      )}
+                    </View>
+                  );
+                })}
+              </View>
+            )}
+
+            {/* 操作 */}
+            <View style={styles.stockActions}>
+              <TouchableOpacity style={styles.restockBtn} onPress={openRestock} activeOpacity={0.85}>
+                <Text style={styles.restockBtnText}>買ってきた物をまとめて登録</Text>
+              </TouchableOpacity>
+              <TouchableOpacity style={styles.stockAddBtn} onPress={() => openStockForm(null)} activeOpacity={0.85}>
+                <Text style={styles.stockAddBtnText}>＋ 品目</Text>
+              </TouchableOpacity>
+            </View>
+
+            {/* 買い物の記録（1枚まとめ写真） */}
+            {restocks.length > 0 && (
+              <View style={styles.recordBox}>
+                <Text style={styles.recordTitle}>買い物の記録</Text>
+                <ScrollView horizontal showsHorizontalScrollIndicator={false}>
+                  {restocks.map(r => {
+                    const d = new Date(r.createdAt);
+                    const label = `${d.getMonth() + 1}/${d.getDate()}`;
+                    return (
+                      <TouchableOpacity
+                        key={r.id}
+                        style={styles.recordItem}
+                        activeOpacity={0.85}
+                        onPress={() => { if (r.photo) setPhotoView(r.photo); }}
+                      >
+                        {r.photo ? (
+                          // @ts-ignore
+                          <img src={r.photo} alt="" style={{ width: 64, height: 64, objectFit: 'cover', borderRadius: 10 }} />
+                        ) : (
+                          <View style={styles.recordNoPhoto}>
+                            <Text style={styles.recordNoPhotoText}>ネット{'\n'}購入</Text>
+                          </View>
+                        )}
+                        <Text style={styles.recordDate}>{label}</Text>
+                        <Text numberOfLines={1} style={styles.recordCount}>
+                          {r.lines?.length ? `${r.lines.length}品` : '写真のみ'}
+                        </Text>
+                      </TouchableOpacity>
+                    );
+                  })}
+                </ScrollView>
+              </View>
+            )}
+
+            {/* 在庫一覧 */}
+            {stocks.length === 0 ? (
+              <Text style={styles.empty}>
+                「＋ 品目」で犬のごはんやコーヒーなどを{'\n'}登録すると、使うペースから残量を自動で減らします
+              </Text>
+            ) : (
+              stocks.map(s => {
+                const now = effectiveQty(s);
+                const d = daysLeft(s);
+                const low = isLow(s);
+                const ratio = d !== null
+                  ? Math.max(0, Math.min(1, d / Math.max(1, (s.alertDays ?? 5) * 3)))
+                  : Math.max(0, Math.min(1, now / Math.max(1, (s.alertQty ?? 1) * 4)));
+                return (
+                  <View key={s.id} style={[styles.stockCard, low && styles.stockCardLow]}>
+                    <TouchableOpacity
+                      style={styles.flex1}
+                      activeOpacity={0.85}
+                      onPress={() => openStockForm(s)}
+                      onLongPress={() => { hapticSelect(); setStockMenu(s); }}
+                    >
+                      <View style={styles.stockTop}>
+                        <Text numberOfLines={1} style={styles.stockName}>{s.name}</Text>
+                        <Text style={[styles.stockQty, low && styles.stockQtyLow]}>
+                          {fmtQty(now)}{s.unit}
+                        </Text>
+                      </View>
+                      <View style={styles.gauge}>
+                        <View style={[
+                          styles.gaugeFill,
+                          { width: `${Math.round(ratio * 100)}%`, backgroundColor: low ? C.or : C.green },
+                        ]} />
+                      </View>
+                      <Text style={styles.stockSub}>
+                        {d !== null
+                          ? `${fmtDays(d)}（1日 ${fmtQty(s.perDay)}${s.unit}）`
+                          : `自動で減らさない（残り${fmtQty(s.alertQty ?? 1)}${s.unit}で通知）`}
+                        {s.autoAdd === false ? '・自動追加オフ' : ''}
+                      </Text>
+                    </TouchableOpacity>
+                    <View style={styles.stockBtns}>
+                      <TouchableOpacity style={styles.stepBtn} onPress={() => bumpStock(s, -1)} activeOpacity={0.8}>
+                        <Text style={styles.stepBtnText}>−1</Text>
+                      </TouchableOpacity>
+                      <TouchableOpacity style={[styles.stepBtn, styles.stepBtnPlus]} onPress={() => bumpStock(s, 1)} activeOpacity={0.8}>
+                        <Text style={[styles.stepBtnText, styles.stepBtnTextPlus]}>＋1</Text>
+                      </TouchableOpacity>
+                    </View>
+                  </View>
+                );
+              })
+            )}
+          </ScrollView>
+        </Animated.View>
+      )}
+
+      {/* ===== タブ3：ポイントカード（上＝コード／下＝ダイヤル） ===== */}
       {activeTab === 'cards' && (
         <Animated.View style={[styles.tabPage, contentStyle]}>
           {/* 上：選択中カードのコード */}
@@ -1011,6 +1553,272 @@ export default function HomeScreen() {
             </TouchableOpacity>
           </View>
         </TouchableOpacity>
+      </Modal>
+
+      {/* ===== 在庫の操作メニュー（長押し） ===== */}
+      <Modal visible={!!stockMenu} transparent animationType="fade" onRequestClose={() => setStockMenu(null)}>
+        <TouchableOpacity style={styles.menuBackdrop} activeOpacity={1} onPress={() => setStockMenu(null)}>
+          <View style={styles.menuCard}>
+            <Text style={styles.menuTitle}>{stockMenu?.name}</Text>
+            <TouchableOpacity style={styles.menuRow} onPress={() => { const s = stockMenu; setStockMenu(null); if (s) openStockForm(s); }}>
+              <Text style={styles.menuRowText}>編集する</Text>
+            </TouchableOpacity>
+            <TouchableOpacity style={styles.menuRow} onPress={() => { if (stockMenu) deleteStock(stockMenu.id); }}>
+              <Text style={[styles.menuRowText, { color: C.or, fontWeight: '800' }]}>削除</Text>
+            </TouchableOpacity>
+            <TouchableOpacity style={[styles.menuRow, styles.menuRowLast]} onPress={() => setStockMenu(null)}>
+              <Text style={[styles.menuRowText, { color: C.txMuted }]}>閉じる</Text>
+            </TouchableOpacity>
+          </View>
+        </TouchableOpacity>
+      </Modal>
+
+      {/* ===== 写真の拡大 ===== */}
+      <Modal visible={!!photoView} transparent animationType="fade" onRequestClose={() => setPhotoView(null)}>
+        <TouchableOpacity style={styles.photoBackdrop} activeOpacity={1} onPress={() => setPhotoView(null)}>
+          {photoView && (
+            // @ts-ignore
+            <img src={photoView} alt="" style={{ maxWidth: '92%', maxHeight: '80%', borderRadius: 14 }} />
+          )}
+        </TouchableOpacity>
+      </Modal>
+
+      {/* ===== 在庫の追加・編集 ===== */}
+      <Modal visible={showStockForm} animationType="slide">
+        <ScrollView style={styles.modal} contentContainerStyle={{ paddingBottom: 40 }}>
+          <Text style={styles.modalTitle}>{editStock ? '在庫を編集' : '在庫に追加'}</Text>
+
+          {!editStock && (
+            <>
+              <Text style={styles.fieldLabel}>よく使う物から選ぶ</Text>
+              <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{ marginBottom: 6 }}>
+                {STOCK_PRESETS.map(p => (
+                  <TouchableOpacity
+                    key={p.name}
+                    onPress={() => applyStockPreset(p)}
+                    style={[styles.stockPreset, sName === p.name && styles.stockPresetOn]}
+                  >
+                    <Text style={[styles.stockPresetText, sName === p.name && styles.stockPresetTextOn]}>{p.name}</Text>
+                  </TouchableOpacity>
+                ))}
+              </ScrollView>
+            </>
+          )}
+
+          <Text style={styles.fieldLabel}>品名</Text>
+          <TextInput
+            style={styles.input}
+            value={sName}
+            onChangeText={setSName}
+            placeholder="例：犬のごはん"
+            placeholderTextColor={C.txFaint}
+          />
+
+          <Text style={styles.fieldLabel}>単位</Text>
+          <View style={styles.chipRow}>
+            {STOCK_UNITS.map(u => (
+              <TouchableOpacity
+                key={u}
+                onPress={() => setSUnit(u)}
+                style={[styles.chip, sUnit === u && styles.chipOn]}
+              >
+                <Text style={[styles.chipText, sUnit === u && styles.chipTextOn]}>{u}</Text>
+              </TouchableOpacity>
+            ))}
+          </View>
+
+          <Text style={styles.fieldLabel}>今ある数量（{sUnit}）</Text>
+          <TextInput
+            style={styles.input}
+            value={sQty}
+            onChangeText={setSQty}
+            placeholder="例：3000"
+            placeholderTextColor={C.txFaint}
+            keyboardType="decimal-pad"
+          />
+
+          <Text style={styles.fieldLabel}>使うペース</Text>
+          <Text style={styles.hintText}>
+            ここを入れておくと、時間の経過にあわせて残量が自動で減ります。
+            例：犬のごはんが1日200gなら「200」＋「1日で」。
+            わからない物は空欄にして、使うたびに「−1」を押してください。
+          </Text>
+          <View style={styles.paceRow}>
+            <TextInput
+              style={[styles.input, { flex: 0, width: 110 }]}
+              value={sPace}
+              onChangeText={setSPace}
+              placeholder="数量"
+              placeholderTextColor={C.txFaint}
+              keyboardType="decimal-pad"
+            />
+            <Text style={styles.paceUnit}>{sUnit} を</Text>
+            <View style={styles.chipRow}>
+              {PACE_PERIODS.map(p => (
+                <TouchableOpacity
+                  key={p.value}
+                  onPress={() => setSPeriod(p.value)}
+                  style={[styles.chip, sPeriod === p.value && styles.chipOn]}
+                >
+                  <Text style={[styles.chipText, sPeriod === p.value && styles.chipTextOn]}>{p.label}</Text>
+                </TouchableOpacity>
+              ))}
+            </View>
+          </View>
+
+          {parseFloat(sPace) > 0 ? (
+            <>
+              <Text style={styles.fieldLabel}>残り何日で知らせる？</Text>
+              <View style={styles.chipRow}>
+                {['3', '5', '7', '10', '14'].map(v => (
+                  <TouchableOpacity
+                    key={v}
+                    onPress={() => setSAlertDays(v)}
+                    style={[styles.chip, sAlertDays === v && styles.chipOn]}
+                  >
+                    <Text style={[styles.chipText, sAlertDays === v && styles.chipTextOn]}>{v}日前</Text>
+                  </TouchableOpacity>
+                ))}
+              </View>
+            </>
+          ) : (
+            <>
+              <Text style={styles.fieldLabel}>残りいくつで知らせる？（{sUnit}）</Text>
+              <TextInput
+                style={styles.input}
+                value={sAlertQty}
+                onChangeText={setSAlertQty}
+                placeholder="例：1"
+                placeholderTextColor={C.txFaint}
+                keyboardType="decimal-pad"
+              />
+            </>
+          )}
+
+          <TouchableOpacity
+            style={[styles.toggleRow, sAutoAdd && styles.toggleRowOn]}
+            onPress={() => { setSAutoAdd(v => !v); hapticTick(); }}
+            activeOpacity={0.85}
+          >
+            <View style={[styles.check, sAutoAdd && styles.checkDone]}>
+              {sAutoAdd && <Text style={styles.checkMark}>✓</Text>}
+            </View>
+            <Text style={styles.toggleText}>少なくなったら買い物リストに自動で入れる</Text>
+          </TouchableOpacity>
+
+          {/* 入力内容の確認 */}
+          {parseFloat(sQty) > 0 && parseFloat(sPace) > 0 && (
+            <Text style={styles.calcNote}>
+              {(() => {
+                const factor = PACE_PERIODS.find(p => p.value === sPeriod)?.perDayFactor ?? 1;
+                const perDay = parseFloat(sPace) * factor;
+                const days = perDay > 0 ? parseFloat(sQty) / perDay : 0;
+                return `いまの数量なら約${Math.floor(days)}日分。${Math.max(0, Math.floor(days) - (parseFloat(sAlertDays) || 0))}日後に「そろそろ買う物」に出ます。`;
+              })()}
+            </Text>
+          )}
+
+          <TouchableOpacity style={styles.saveBtn} onPress={saveStock} activeOpacity={0.85}>
+            <Text style={styles.saveBtnText}>保存</Text>
+          </TouchableOpacity>
+          <TouchableOpacity style={styles.cancelBtn} onPress={() => { setShowStockForm(false); setEditStock(null); }}>
+            <Text style={styles.cancelBtnText}>キャンセル</Text>
+          </TouchableOpacity>
+        </ScrollView>
+      </Modal>
+
+      {/* ===== まとめ補充 ===== */}
+      <Modal visible={showRestock} animationType="slide">
+        <ScrollView style={styles.modal} contentContainerStyle={{ paddingBottom: 40 }}>
+          <Text style={styles.modalTitle}>買ってきた物を登録</Text>
+          <Text style={styles.hintText}>
+            レジ袋から出す前に1枚だけ撮っておけば記録になります。
+            ネットで買った物は写真なしのままで大丈夫です。
+            下の品目で買った数を足してください。
+          </Text>
+
+          {Platform.OS === 'web' && (
+            <>
+              {/* @ts-ignore Web専用のファイル入力（カメラ or 写真ライブラリ） */}
+              <input
+                ref={photoInput}
+                type="file"
+                accept="image/*"
+                style={{ display: 'none' }}
+                onChange={(e: any) => pickPhoto(e.target.files?.[0])}
+              />
+              <TouchableOpacity
+                style={styles.photoBtn}
+                activeOpacity={0.85}
+                onPress={() => photoInput.current?.click?.()}
+              >
+                <Text style={styles.photoBtnText}>
+                  {rBusy ? '読み込み中...' : rPhoto ? '写真を撮り直す / 選び直す' : '写真を撮る / 選ぶ（省略可）'}
+                </Text>
+              </TouchableOpacity>
+            </>
+          )}
+
+          {rPhoto && (
+            <View style={styles.photoPreview}>
+              {/* @ts-ignore */}
+              <img src={rPhoto} alt="" style={{ maxWidth: '100%', maxHeight: 240, borderRadius: 14 }} />
+              <TouchableOpacity onPress={() => setRPhoto(null)}>
+                <Text style={styles.photoClear}>写真を外す</Text>
+              </TouchableOpacity>
+            </View>
+          )}
+
+          <TextInput
+            style={[styles.input, { marginTop: 12 }]}
+            value={rMemo}
+            onChangeText={setRMemo}
+            placeholder="メモ（例：カインズでまとめ買い／楽天で注文）"
+            placeholderTextColor={C.txFaint}
+          />
+
+          <Text style={styles.fieldLabel}>買った数を足す</Text>
+          {stocks.length === 0 ? (
+            <Text style={styles.hintText}>先に「＋ 品目」で在庫を登録してください。</Text>
+          ) : (
+            stocks.map(s => {
+              const add = rLines[s.id] ?? 0;
+              const step = s.unit === 'g' || s.unit === 'ml' ? 100 : 1;
+              return (
+                <View key={s.id} style={[styles.restockRow, add > 0 && styles.restockRowOn]}>
+                  <View style={styles.flex1}>
+                    <Text numberOfLines={1} style={styles.restockName}>{s.name}</Text>
+                    <Text style={styles.restockSub}>
+                      いま {fmtQty(effectiveQty(s))}{s.unit}
+                      {add > 0 ? ` → ${fmtQty(effectiveQty(s) + add)}${s.unit}` : ''}
+                    </Text>
+                  </View>
+                  <View style={styles.stockBtns}>
+                    <TouchableOpacity style={styles.stepBtn} onPress={() => { hapticTick(); setLine(s.id, add - step); }} activeOpacity={0.8}>
+                      <Text style={styles.stepBtnText}>−</Text>
+                    </TouchableOpacity>
+                    <Text style={styles.restockAdd}>{add > 0 ? `+${fmtQty(add)}` : '0'}</Text>
+                    <TouchableOpacity style={[styles.stepBtn, styles.stepBtnPlus]} onPress={() => { hapticTick(); setLine(s.id, add + step); }} activeOpacity={0.8}>
+                      <Text style={[styles.stepBtnText, styles.stepBtnTextPlus]}>＋</Text>
+                    </TouchableOpacity>
+                  </View>
+                </View>
+              );
+            })
+          )}
+
+          <TouchableOpacity
+            style={[styles.saveBtn, rBusy && { opacity: 0.5 }]}
+            onPress={saveRestock}
+            disabled={rBusy}
+            activeOpacity={0.85}
+          >
+            <Text style={styles.saveBtnText}>{rBusy ? '保存中...' : '保存'}</Text>
+          </TouchableOpacity>
+          <TouchableOpacity style={styles.cancelBtn} onPress={() => setShowRestock(false)}>
+            <Text style={styles.cancelBtnText}>キャンセル</Text>
+          </TouchableOpacity>
+        </ScrollView>
       </Modal>
 
       {/* ===== カード追加 ===== */}
@@ -1182,6 +1990,107 @@ const styles = StyleSheet.create({
   itemDone: { textDecorationLine: 'line-through', color: C.txFaint, fontWeight: '400' },
   deleteBtn: { color: C.or, fontSize: 12.5, fontWeight: '700' },
   empty: { textAlign: 'center', color: C.txFaint, marginTop: 40, fontSize: 15 },
+
+  // ===== 在庫 =====
+  alertBox: {
+    backgroundColor: '#FFF6F2', borderRadius: 18, borderWidth: 1.5, borderColor: 'rgba(255,69,0,0.35)',
+    padding: 12, marginBottom: 12,
+  },
+  alertTitle: { fontSize: 13, fontWeight: '800', color: C.or, marginBottom: 8 },
+  alertRow: { flexDirection: 'row', alignItems: 'center', gap: 10, paddingVertical: 6 },
+  alertName: { fontSize: 15, fontWeight: '700', color: C.tx },
+  alertSub: { fontSize: 11.5, color: C.txMuted, marginTop: 2 },
+  alertBtn: { height: 32, paddingHorizontal: 13, borderRadius: 16, backgroundColor: C.or, alignItems: 'center', justifyContent: 'center' },
+  alertBtnText: { color: '#fff', fontSize: 12, fontWeight: '800' },
+  alertDone: { fontSize: 11.5, color: C.green, fontWeight: '700' },
+
+  stockActions: { flexDirection: 'row', gap: 8, marginBottom: 12 },
+  restockBtn: { flex: 1, backgroundColor: C.or, borderRadius: 16, paddingVertical: 13, alignItems: 'center' },
+  restockBtnText: { color: '#fff', fontSize: 13.5, fontWeight: '800' },
+  stockAddBtn: {
+    paddingHorizontal: 14, borderRadius: 16, backgroundColor: '#fff',
+    borderWidth: 1.5, borderColor: C.greenLine, alignItems: 'center', justifyContent: 'center',
+  },
+  stockAddBtnText: { color: C.green, fontSize: 13, fontWeight: '800' },
+
+  recordBox: { marginBottom: 14 },
+  recordTitle: { fontSize: 12, fontWeight: '800', color: C.txMuted, letterSpacing: 1, marginBottom: 8 },
+  recordItem: { width: 66, marginRight: 10, alignItems: 'center' },
+  recordNoPhoto: {
+    width: 64, height: 64, borderRadius: 10, backgroundColor: C.field,
+    borderWidth: 1, borderColor: C.line, alignItems: 'center', justifyContent: 'center',
+  },
+  recordNoPhotoText: { fontSize: 9.5, color: C.txFaint, textAlign: 'center', lineHeight: 12 },
+  recordDate: { fontSize: 10.5, color: C.txMuted, fontWeight: '700', marginTop: 3 },
+  recordCount: { fontSize: 9.5, color: C.txFaint },
+
+  stockCard: {
+    flexDirection: 'row', alignItems: 'center', gap: 10, backgroundColor: '#fff',
+    borderRadius: 16, borderWidth: 1, borderColor: C.line, padding: 13, marginBottom: 8,
+  },
+  stockCardLow: { borderColor: 'rgba(255,69,0,0.45)', borderWidth: 1.5 },
+  stockTop: { flexDirection: 'row', alignItems: 'baseline', justifyContent: 'space-between', gap: 8 },
+  stockName: { fontSize: 15.5, fontWeight: '700', color: C.tx, flexShrink: 1 },
+  stockQty: { fontSize: 15, fontWeight: '800', color: C.green },
+  stockQtyLow: { color: C.or },
+  gauge: { height: 6, borderRadius: 3, backgroundColor: C.field, marginTop: 7, overflow: 'hidden' },
+  gaugeFill: { height: 6, borderRadius: 3 },
+  stockSub: { fontSize: 11, color: C.txFaint, marginTop: 6 },
+  stockBtns: { flexDirection: 'row', alignItems: 'center', gap: 6 },
+  stepBtn: {
+    width: 42, height: 38, borderRadius: 12, backgroundColor: C.field,
+    borderWidth: 1, borderColor: C.line, alignItems: 'center', justifyContent: 'center',
+  },
+  stepBtnPlus: { backgroundColor: C.green, borderColor: C.green },
+  stepBtnText: { fontSize: 13.5, fontWeight: '800', color: C.txMuted },
+  stepBtnTextPlus: { color: '#fff' },
+
+  // 在庫フォーム
+  chipRow: { flexDirection: 'row', gap: 7, flexWrap: 'wrap' },
+  chip: {
+    paddingHorizontal: 13, paddingVertical: 9, borderRadius: 14,
+    backgroundColor: '#fff', borderWidth: 1, borderColor: C.line,
+  },
+  chipOn: { backgroundColor: C.green, borderColor: C.green },
+  chipText: { fontSize: 13, color: C.txMuted, fontWeight: '700' },
+  chipTextOn: { color: '#fff', fontWeight: '800' },
+  stockPreset: {
+    paddingHorizontal: 13, paddingVertical: 10, borderRadius: 14, marginRight: 8,
+    backgroundColor: '#fff', borderWidth: 1, borderColor: C.line,
+  },
+  stockPresetOn: { borderColor: C.green, borderWidth: 2 },
+  stockPresetText: { fontSize: 13, color: C.txMuted, fontWeight: '700' },
+  stockPresetTextOn: { color: C.green, fontWeight: '800' },
+  paceRow: { flexDirection: 'row', alignItems: 'center', gap: 8, flexWrap: 'wrap' },
+  paceUnit: { fontSize: 13.5, color: C.txMuted, fontWeight: '700' },
+  toggleRow: {
+    flexDirection: 'row', alignItems: 'center', gap: 11, marginTop: 20,
+    backgroundColor: '#fff', borderRadius: 16, borderWidth: 1, borderColor: C.line, padding: 14,
+  },
+  toggleRowOn: { borderColor: C.greenLine, borderWidth: 1.5 },
+  toggleText: { flex: 1, fontSize: 13.5, color: C.tx, fontWeight: '700' },
+  calcNote: {
+    fontSize: 12, color: C.green, fontWeight: '700', marginTop: 14,
+    backgroundColor: 'rgba(0,128,0,0.07)', borderRadius: 12, padding: 12, lineHeight: 18,
+  },
+
+  // まとめ補充
+  photoBtn: {
+    backgroundColor: '#fff', borderRadius: 16, borderWidth: 1.5, borderColor: C.greenLine,
+    paddingVertical: 15, alignItems: 'center', marginTop: 6,
+  },
+  photoBtnText: { fontSize: 14, fontWeight: '800', color: C.green },
+  photoPreview: { alignItems: 'center', marginTop: 12 },
+  photoClear: { fontSize: 12, color: C.or, fontWeight: '800', marginTop: 8 },
+  photoBackdrop: { flex: 1, backgroundColor: 'rgba(18,36,15,0.85)', alignItems: 'center', justifyContent: 'center' },
+  restockRow: {
+    flexDirection: 'row', alignItems: 'center', gap: 10, backgroundColor: '#fff',
+    borderRadius: 16, borderWidth: 1, borderColor: C.line, padding: 12, marginBottom: 8,
+  },
+  restockRowOn: { borderColor: C.greenLine, borderWidth: 1.5, backgroundColor: 'rgba(0,128,0,0.04)' },
+  restockName: { fontSize: 14.5, fontWeight: '700', color: C.tx },
+  restockSub: { fontSize: 11, color: C.txFaint, marginTop: 2 },
+  restockAdd: { fontSize: 13, fontWeight: '800', color: C.green, minWidth: 44, textAlign: 'center' },
 
   // 上のコードシート（薄いグリーンの縁取り）
   codeSheet: {
